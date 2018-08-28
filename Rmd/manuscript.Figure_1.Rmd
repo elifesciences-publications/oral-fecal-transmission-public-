@@ -1,0 +1,1041 @@
+---
+title: "Oral-Gut, Figure 1"
+author: "Sebastian Schmidt"
+date: "5/27/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Prepare Environment
+
+Attach relevant packages
+
+```{r}
+library("Matrix", warn.conflicts=F, quietly=T)
+library("readxl", warn.conflicts=F, quietly=T)
+library("plyr", warn.conflicts=F, quietly=T)
+library("ape", warn.conflicts=F, quietly=T)
+library("phytools", warn.conflicts=F, quietly=T)
+library("reshape2", warn.conflicts=F, quietly=T)
+library("ggplot2", warn.conflicts=F, quietly=T)
+library("ggalluvial", warn.conflicts=F, quietly=T)
+library("ggtree", warn.conflicts=F, quietly=T)
+library("gridExtra", warn.conflicts=F, quietly=T)
+library("cowplot", warn.conflicts=F, quietly=T)
+library("extrafont", warn.conflicts=F, quietly=T)
+library("RColorBrewer", warn.conflicts=F, quietly=T)
+```
+
+Set parameters.
+
+```{r}
+PARAM <- list()
+PARAM$folder.R <- paste0(getwd(), "/")
+PARAM$folder.base <- gsub("Rmd/", "", PARAM$folder.R)
+PARAM$folder.data <- paste0(PARAM$folder.base, "data/")
+PARAM$folder.parameters <- paste0(PARAM$folder.base, "parameters/")
+PARAM$folder.results <- paste0(PARAM$folder.base, "results/")
+PARAM$folder.results_detection <- paste0(PARAM$folder.results, "detect.transmission/")
+PARAM$folder.results_quantification <- paste0(PARAM$folder.results, "quantify.transmission/")
+PARAM$folder.results_directionality <- paste0(PARAM$folder.results, "establish.directionality/")
+PARAM$folder.manuscript.figure <- paste0(PARAM$folder.base, "manuscript/Figures/Figure_1.transmission_summary/")
+#=> taxa metadata (based on PATRIC)
+PARAM$file.data_taxa_PATRIC <- paste0(PARAM$folder.parameters, "taxa_metadata.PATRIC_plus.20171017.310.xlsx")
+
+#Colours to match individual body sites
+PARAM$colour.saliva <- "#08519c"
+PARAM$colour.plaque <- "#c51b7d"
+PARAM$colour.gut <- "#fd8d3c"
+
+#Colours to match transmitter categories
+PARAM$colour.transmitter <- "#33a02c"
+PARAM$colour.occ_transmitter <- "#b2df8a"
+PARAM$colour.non_transmitter <- "#a6cee3"
+```
+
+Set global plotting theme.
+
+```{r}
+#Theme to bw
+theme_set(theme_minimal())
+
+#Update individual aspects of the plot theme
+theme_update(axis.line=element_blank(),
+             axis.text.y=element_blank(),
+             axis.ticks=element_blank(),
+             axis.title.x=element_text(family="Helvetica", size=4),
+             axis.title.y=element_blank(),
+             legend.position="none",
+             panel.background=element_blank(),
+             panel.border=element_blank(),
+             #panel.grid.major=element_blank(),
+             panel.grid.minor=element_blank(),
+             plot.background=element_blank(),
+             plot.margin=unit(c(0.1, 0.2, 0.1, 0), "cm")
+)
+
+#Define a function for summary statistics per taxon
+fun.summary <- function(vec) {data.frame(ymin=quantile(vec)[2], y=median(vec), ymax=quantile(vec)[4])}
+```
+
+Load data
+
+```{r}
+#Load sample data
+load(paste0(PARAM$folder.parameters, "data.sample.RData"))
+#Load timepoint data
+load(paste0(PARAM$folder.parameters, "data.timepoint.RData"))
+#Load taxa data
+load(paste0(PARAM$folder.data, "data.taxa.SNV.RData"))
+#Load specI abundance data
+load(paste0(PARAM$folder.data, "data.specI.RData"))
+#Load coverage data
+load(paste0(PARAM$folder.data, "data.coverage.RData"))
+#Load taxonomy data
+load(paste0(PARAM$folder.data, "data.taxonomy.RData"))
+#Load phylogeny
+load(paste0(PARAM$folder.data, "data.tree.RData"))
+#Load relative enrichment data
+load(paste0(PARAM$folder.data, "data.enrichment.RData"))
+#Load transmission detection results
+load(paste0(PARAM$folder.results, "data.detect.transmission.RData"))
+#Load transmission quantification results
+load(paste0(PARAM$folder.results, "data.quantify.transmission.RData"))
+#Load transmission directionality data
+load(paste0(PARAM$folder.results, "data.directionality.RData"))
+#Load transmission rates data
+load(paste0(PARAM$folder.results, "data.transmission_rates.RData"))
+#Load data on longitudinal stability
+load(paste0(PARAM$folder.results, "data.stability.RData"))
+```
+
+Parse taxa annotations and re-filter all data structures.
+
+```{r}
+#Read manually curated taxa metadata from XLSX
+data.taxa.PATRIC.xlsx <- as.data.frame(read_xlsx(PARAM$file.data_taxa_PATRIC, sheet=1))
+
+#Sub-select data.taxa.transmission on saliva <-> gut only (the other site combinations are not relevant for this figure)
+my.data.taxa.transmission <- data.taxa.transmission[["saliva_gut"]]
+
+#Set row.names for data.taxa.PATRIC, data.taxa.transmission and data.taxa
+rownames(data.taxa.PATRIC.xlsx) <- data.taxa.PATRIC.xlsx$`NCBI Taxon ID`
+rownames(my.data.taxa.transmission) <- as.character(my.data.taxa.transmission$Tax_ID)
+rownames(data.taxa) <- data.taxa$Tax_ID
+
+#Force re-order PATRIC and transmission data to match data.taxa
+data.taxa.PATRIC.xlsx <- data.taxa.PATRIC.xlsx[match(rownames(data.taxa), rownames(data.taxa.PATRIC.xlsx)), ]
+my.data.taxa.transmission <- my.data.taxa.transmission[match(rownames(data.taxa), rownames(my.data.taxa.transmission)), ]
+
+#Concatenate both datasets
+my.data.taxa <- cbind(data.taxa, data.taxa.PATRIC.xlsx[, !colnames(data.taxa.PATRIC.xlsx) %in% colnames(data.taxa)])
+my.data.taxa <- cbind(my.data.taxa, my.data.taxa.transmission[, !colnames(my.data.taxa.transmission) %in% colnames(my.data.taxa)])
+
+#Annotate number of subjects with evidence for transmission, and subset
+tmp <- ddply(data.detect_transmission[data.detect_transmission$coupled.sites == "saliva_gut", ], "Taxon", function(df) {
+  data.frame(
+    transmitted.in_subjects = sum(df$S.z.bg_cohort.all.p.adj < 0.05)
+  )
+})
+my.data.taxa.fullest <- my.data.taxa
+my.data.taxa <- my.data.taxa[as.character(my.data.taxa$Scientific_Name) %in% as.character(tmp$Taxon), ]
+my.data.taxa[match(as.character(my.data.taxa$Scientific_Name), as.character(tmp$Taxon)), "transmitted.in_subjects"] <- tmp$transmitted.in_subjects
+my.data.taxa$transmitter.in_some <- my.data.taxa$transmitted.in_subjects > 0
+my.data.taxa.full <- my.data.taxa
+my.data.taxa.fullest$transmitter.in_some <- FALSE
+my.data.taxa.fullest$transmitter.in_some[match(as.character(my.data.taxa$Tax_ID), as.character(my.data.taxa.fullest$Tax_ID))] <- my.data.taxa$transmitter.in_some
+transmitting_in_some <- as.character(my.data.taxa$Scientific_Name)[my.data.taxa$transmitter.in_some & !is.na(my.data.taxa$transmitter.in_some) & !my.data.taxa$transmitter]
+```
+
+Filter to relevant set of taxa
+
+```{r}
+#Filter for taxa with sufficient data for dependable transmission detection
+curr.n_proc <- ddply(data.detect_transmission, "Taxon", nrow)
+keep.by_detectability <- curr.n_proc$Taxon[curr.n_proc$V1 > 20]
+
+#Filter taxa by prevalence in oral and gut samples
+keep.by_prevalence <- my.data.taxa$prevalence.saliva > 0.1 & my.data.taxa$prevalence.gut > 0.1
+
+#Filter by availability of transmission score data
+#=> minimum number of scored individuals
+keep.by_transmission_scores <- sum(!is.na(my.data.taxa$Z.bg_cohort.all.mean))
+
+#Subset by combining these filters
+keep.taxa <- as.character(my.data.taxa$Tax_ID)[keep.by_prevalence & my.data.taxa$Scientific_Name %in% keep.by_detectability]
+#keep.taxa <- keep.tax_id
+my.data.taxa <- droplevels(my.data.taxa[keep.taxa, ])
+my.data.detect_transmission <- droplevels(data.detect_transmission[data.detect_transmission$Tax_ID %in% keep.taxa & data.detect_transmission$coupled.sites == "saliva_gut", ])
+my.data.directionality <- droplevels(data.directionality[data.directionality$Tax_ID %in% keep.taxa & data.directionality$source_sink %in% c("saliva_to_stool", "stool_to_saliva"), ])
+my.data.quantify_transmission <- data.quantify_transmission[data.quantify_transmission$Tax_ID %in% keep.taxa, ]
+my.data.rates <- droplevels(data.rates[data.rates$Tax_ID %in% keep.taxa & !is.na(data.rates$delta_t.bin), ])
+tmp.data.rates <- rbind(data.rates[, colnames(data.rates) %in% colnames(data.rates.bg)], data.rates.bg)
+my.data.rates.full <- droplevels(tmp.data.rates[tmp.data.rates$Tax_ID %in% keep.taxa & !is.na(tmp.data.rates$delta_t.bin), ])
+my.data.rates.full$delta_t.bin <- factor(my.data.rates.full$delta_t.bin, levels = c("intra.indiv", "bg.coupled", "bg.longitudinal"))
+
+#Subset specI abundance tables and report rel abd represented by selected taxa
+sub.specI.oral <- data.specI.rel[keep.taxa, rownames(data.sample)[data.sample$material == "saliva"]]
+sub.specI.gut <- data.specI.rel[keep.taxa, rownames(data.sample)[data.sample$material == "stool"]]
+```
+
+Get taxa orderings.
+
+```{r}
+#=> by decreasing median transmission score
+order.by_transmission_score <- order(my.data.taxa$Z.bg_cohort.all.median, decreasing = T)
+#=> by transmissibility (fraction of subjects w/ TS > median(bg))
+order.by_transmissibility <- order(my.data.taxa$Z.bg_cohort.all.transmissibility.raw, decreasing = T)
+#=> by transmission p value
+order.by_p_value <- order(my.data.taxa$Z.bg_cohort.all.wilcox.p, decreasing = F)
+#=> by transmission category, followed by transmission score
+my.data.taxa$transmitter.category <- "non-transmitter"
+my.data.taxa$transmitter.category[my.data.taxa$transmitter.in_some] <- "occasional transmitter"
+my.data.taxa$transmitter.category[my.data.taxa$transmitter] <- "transmitter"
+my.data.taxa$transmitter.category <- factor(my.data.taxa$transmitter.category, levels=c("non-transmitter", "occasional transmitter", "transmitter"))
+order.by_category <- order(my.data.taxa$transmitter.category, my.data.taxa$Z.bg_cohort.all.median, decreasing = T)
+
+#Define which order to use
+order.use <- order.by_category
+
+#Re-order all taxa (incl predominantly oral and fecal species)
+my.data.taxa.full$transmitter.category <- ""
+my.data.taxa.full$transmitter.category[my.data.taxa.full$prevalence.gut >= 0.1 & my.data.taxa.full$prevalence.saliva <= 0.1] <- "predominantly fecal"
+my.data.taxa.full$transmitter.category[my.data.taxa.full$prevalence.gut <= 0.1 & my.data.taxa.full$prevalence.saliva >= 0.1] <- "predominantly oral"
+my.data.taxa.full$transmitter.category[my.data.taxa.full$prevalence.gut > 0.1 & my.data.taxa.full$prevalence.saliva > 0.1 & !my.data.taxa.full$transmitter] <- "non-transmitter"
+my.data.taxa.full$transmitter.category[my.data.taxa.full$transmitter.in_some] <- "occasional transmitter"
+my.data.taxa.full$transmitter.category[my.data.taxa.full$transmitter] <- "transmitter"
+my.data.taxa.full$transmitter.category <- factor(my.data.taxa.full$transmitter.category, levels=rev(c("predominantly oral", "transmitter", "occasional transmitter", "non-transmitter", "predominantly fecal")))
+
+my.data.taxa.fullest$transmitter.category <- ""
+my.data.taxa.fullest$transmitter.category[my.data.taxa.fullest$prevalence.gut >= 0.1 & my.data.taxa.fullest$prevalence.saliva <= 0.1] <- "predominantly fecal"
+my.data.taxa.fullest$transmitter.category[my.data.taxa.fullest$prevalence.gut <= 0.1 & my.data.taxa.fullest$prevalence.saliva >= 0.1] <- "predominantly oral"
+my.data.taxa.fullest$transmitter.category[my.data.taxa.fullest$prevalence.gut > 0.1 & my.data.taxa.fullest$prevalence.saliva > 0.1 & (!my.data.taxa.fullest$transmitter | is.na(my.data.taxa.fullest$transmitter))] <- "non-transmitter"
+my.data.taxa.fullest$transmitter.category[match(as.character(my.data.taxa.full$Tax_ID), as.character(my.data.taxa.fullest$Tax_ID))] <- as.character(my.data.taxa.full$transmitter.category)
+my.data.taxa.fullest$transmitter.category <- factor(my.data.taxa.fullest$transmitter.category, levels=rev(c("predominantly oral", "transmitter", "occasional transmitter", "non-transmitter", "predominantly fecal")))
+
+
+#Manually fix some missing annotations
+my.data.taxa.full[my.data.taxa.full$Class == "undef", "Class"] <- "Bacteroidia"
+
+#Re-order classes w/in Firmicutes (i.e., rotating branch at the base of the Firmicutes tree)
+my.data.taxa$Class <- factor(my.data.taxa$Class, levels=c("Bacilli", "Negativicutes", "Erysipelotrichi", "Clostridia", levels(my.data.taxa$Class)[5:length(levels(my.data.taxa$Class))]))
+my.data.taxa.full$Class <- factor(my.data.taxa.full$Class, levels=c("Bacilli", "Negativicutes", "Erysipelotrichi", "Clostridia", levels(my.data.taxa.full$Class)[5:length(levels(my.data.taxa.full$Class))]))
+#Re-order families accordingly
+tmp.family <- as.character(my.data.taxa.full$Family)
+tmp.family[tmp.family == "undef" & my.data.taxa.full$Class == "Clostridia"] <- "Clostridia undef"
+tmp.family[tmp.family == "undef" & my.data.taxa.full$Class == "Bacilli"] <- "Bacilli undef"
+tmp.family[tmp.family == "undef" & my.data.taxa.full$Class == "Bacteroidetes"] <- "Bacteroidetes undef"
+my.data.taxa.full$Family <- factor(
+  tmp.family,
+  levels=unique(c(
+    levels(droplevels(my.data.taxa.full$Family[my.data.taxa.full$Class == "Bacilli" & my.data.taxa.full$Family != "undef"])), "Bacilli undef",
+    levels(droplevels(my.data.taxa.full$Family[my.data.taxa.full$Class == "Negativicutes"])),
+    levels(droplevels(my.data.taxa.full$Family[my.data.taxa.full$Class == "Erysipelotrichi"])),
+    levels(droplevels(my.data.taxa.full$Family[my.data.taxa.full$Class == "Clostridia" & my.data.taxa.full$Family != "undef"])), "Clostridia undef",
+    levels(droplevels(my.data.taxa.full$Family[! my.data.taxa.full$Phylum %in% "Firmicutes" & my.data.taxa.full$Family != "undef"])), "Bacteroidetes undef"
+  ))
+)
+
+#Define order
+#=> by transmission category, followed by transmission score & prevalence in oral/gut
+order.full <- order(my.data.taxa.full$transmitter.category, my.data.taxa.full$Z.bg_cohort.all.median, decreasing = T)
+#Re-order pred. oral and fecal taxa by decreasing oral/fecal prevalence
+sub_idx.oral <- 1:sum(my.data.taxa.full$transmitter.category == "predominantly oral")
+order.full[sub_idx.oral] <- order.full[sub_idx.oral][order(my.data.taxa.full[order.full[sub_idx.oral], "prevalence.saliva"], my.data.taxa.full[order.full[sub_idx.oral], "prevalence.gut"], decreasing = T)]
+sub_idx.fecal <- (nrow(my.data.taxa.full)-sum(my.data.taxa.full$transmitter.category == "predominantly fecal")+1):nrow(my.data.taxa.full)
+order.full[sub_idx.fecal] <- order.full[sub_idx.fecal][order(my.data.taxa.full[order.full[sub_idx.fecal], "prevalence.gut"], my.data.taxa.full[order.full[sub_idx.fecal], "prevalence.saliva"], decreasing = T)]
+```
+
+Prune & process phylogenetic tree.
+
+```{r}
+#Subset tree
+my.tree <- drop.tip(taxa.tree, which(!taxa.tree$tip.label %in% as.character(my.data.taxa$Tax_ID)))
+my.tree.full <- drop.tip(taxa.tree, which(!taxa.tree$tip.label %in% as.character(my.data.taxa.full$Tax_ID)))
+#Re-label tips with species names
+my.tree.full.labelled <- my.tree.full
+my.tree.full.labelled$tip.label <- as.character(my.data.taxa.full$Species[match(my.tree.full.labelled$tip.label, my.data.taxa.full$Tax_ID)])
+my.tree.full.labelled.SciNa <- my.tree.full
+my.tree.full.labelled.SciNa$tip.label <- as.character(my.data.taxa.full$Scientific_Name[match(my.tree.full.labelled.SciNa$tip.label, my.data.taxa.full$Tax_ID)])
+#Rotate internal nodes to match transmission score ordering
+my.tree.rot <- minRotate(my.tree, match(as.character(my.data.taxa$Tax_ID[order.use]), my.tree$tip.label))
+my.tree.rot <- rotateConstr(my.tree, as.character(my.data.taxa$Tax_ID[order.use]))
+
+#Get re-ordered tip order
+order.tips <- my.tree.rot$edge[my.tree.rot$edge[,2] <= length(my.tree.rot$tip.label), 2]
+order.tips.tax_id <- my.tree.rot$tip.label[order.tips]
+
+#Plot agreement between (re-ordered) tree and sorted transmission scores
+order.my_taxa.tax_id <- as.character(my.data.taxa$Tax_ID)[order.use]
+order.by_tree <- match(order.tips.tax_id, as.character(my.data.taxa$Tax_ID))
+plot.tree_order <- data.frame(
+  Tax_ID = rep.int(order.my_taxa.tax_id, 2),
+  x = c(1:125, match(order.tips.tax_id, order.my_taxa.tax_id)),
+  y = c(rep.int(0, 125), rep.int(1, 125))
+)
+p.tree_order <- ggplot(plot.tree_order, aes(x=x, y=y, group=Tax_ID)) +
+  geom_line() +
+  theme_minimal()
+p.tree_order
+
+#as.character(my.data.taxa$Family)[match(order.tips.tax_id, as.character(my.data.taxa$Tax_ID))]
+#as.character(my.data.taxa$Species)[match(order.tips.tax_id, as.character(my.data.taxa$Tax_ID))]
+
+p.tree <- ggtree(my.tree.full.labelled) +
+  geom_tiplab(align = T, angle=90) +
+  coord_flip() +
+  theme_tree2() +
+  NULL
+p.tree
+
+ggsave(p.tree, width=30, height=15, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_1.draft.tree.pdf"), useDingbats=F, dpi=1200)
+```
+
+Define taxonomic levels for plotting.
+
+```{r}
+my.data.taxa.full$taxonomy.plot <- ""
+#Firmicutes
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus == "Streptococcus"] <- "Streptococcus"
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus != "Streptococcus" & my.data.taxa.full$Class == "Bacilli"] <- "other Bacilli"
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus %in% c("Catonella", "Solobacterium", "Bulleidia")] <- "other Bacilli"
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus == "Veillonella"] <- "Veillonella"
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus != "Veillonella" & my.data.taxa.full$Class == "Negativicutes"] <- "other Negativicutes"
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus != "Catonella" & my.data.taxa.full$Class == "Clostridia"] <- "Clostridia"
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus == "Abiotrophia"] <- "Clostridia"
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Class == "Erysipelotrichi"] <- "Erysipelotrichi"
+#Actinobacteria
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus == "Actinomyces"] <- "Actinomyces"
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus != "Actinomyces" & my.data.taxa.full$Phylum == "Actinobacteria"] <- "other Actinobacteria"
+#Fusobacteria
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Phylum == "Fusobacteria"] <- "Fusobacteria"
+#Proteobacteria
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Family == "Pasteurellaceae"] <- "Pasteurellaceae"
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Family != "Pasteurellaceae" & my.data.taxa.full$Phylum == "Proteobacteria"] <- "other Proteobacteria"
+#Bacteroidetes
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus == "Prevotella"] <- "Prevotella"
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Genus == "Bacteroides"] <- "Bacteroides"
+my.data.taxa.full$taxonomy.plot[!my.data.taxa.full$Genus %in% c("Prevotella", "Bacteroides") & my.data.taxa.full$Phylum == "Bacteroidetes"] <- "other Bacteroidetes"
+#Other phyla
+my.data.taxa.full$taxonomy.plot[my.data.taxa.full$Phylum %in% c("Verrucomicrobia", "Spirochaetes")] <- "other"
+#Re-order levels to match tree
+my.data.taxa.full$taxonomy.plot <- factor(my.data.taxa.full$taxonomy.plot, levels=c(
+  "Streptococcus",
+  "other Bacilli",
+  "Veillonella",
+  "other Negativicutes",
+  "Erysipelotrichi",
+  "Clostridia",
+  "Actinomyces",
+  "other Actinobacteria",
+  "Fusobacteria",
+  "Pasteurellaceae",
+  "other Proteobacteria",
+  "Prevotella",
+  "Bacteroides",
+  "other Bacteroidetes",
+  "other"
+))
+```
+
+## Process Data & Generate Plots
+
+Generate combined prevalence plot.
+
+```{r}
+plot.pre_df <- my.data.taxa
+plot.pre_df$prevalence.gut <- 0 - plot.pre_df$prevalence.gut
+plot.df <- melt(plot.pre_df, c("Scientific_Name", "Species"), measure.vars=c("prevalence.saliva", "prevalence.gut"))
+p.prevalence.all <- ggplot(plot.df, aes(x=Scientific_Name, y=variable, fill=value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = PARAM$colour.gut, mid = "white", high = PARAM$colour.saliva, midpoint = 0, space = "Lab", limits=c(-1, 1)) +
+  scale_x_discrete(limits=as.character(my.data.taxa$Scientific_Name)[order.use], labels=as.character(my.data.taxa$Species)[order.use]) +
+  scale_y_discrete(limits=c("prevalence.gut", "prevalence.saliva")) +
+  theme_minimal() +
+  theme(
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    #axis.text.y=element_text(family="Helvetica", size=5),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  )
+p.prevalence.all
+```
+
+Generate combined prevalence plot, for all taxa (=> full taxa list).
+
+```{r}
+plot.pre_df <- my.data.taxa.full
+plot.pre_df$prevalence.gut <- 0 - plot.pre_df$prevalence.gut
+plot.df <- melt(plot.pre_df, c("Scientific_Name", "Species"), measure.vars=c("prevalence.saliva", "prevalence.gut"))
+p.prevalence.full <- ggplot(plot.df, aes(x=Scientific_Name, y=variable, fill=value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = PARAM$colour.gut, mid = "white", high = PARAM$colour.saliva, midpoint = 0, space = "Lab", limits=c(-1, 1)) +
+  scale_x_discrete(limits=as.character(my.data.taxa.full$Scientific_Name)[order.full], labels=as.character(my.data.taxa.full$Species)[order.full]) +
+  scale_y_discrete(limits=c("prevalence.gut", "prevalence.saliva")) +
+  theme_minimal() +
+  theme(
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    #axis.text.y=element_text(family="Helvetica", size=5),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  )
+p.prevalence.full
+```
+
+Generate prevalence colour scales.
+
+```{r}
+p.scale.prev_oral <- ggplot(data.frame(x=seq(0,1, by=0.01)), aes(x=x, y=1, fill=x)) +
+  geom_tile() +
+  scale_fill_continuous(low="white", high=PARAM$colour.saliva) +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    #panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    #axis.text.y=element_text(family="Helvetica", size=5),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  )
+p.scale.prev_oral
+p.scale.prev_gut <- ggplot(data.frame(x=seq(0,1, by=0.01)), aes(x=x, y=1, fill=x)) +
+  geom_tile() +
+  scale_fill_continuous(low="white", high=PARAM$colour.gut) +
+  theme_minimal() +
+  theme(
+    #panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    #axis.text.y=element_text(family="Helvetica", size=5),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  )
+p.scale.prev_gut
+```
+
+Transmission categories as heatmap.
+
+```{r}
+plot.df <- my.data.taxa
+p.transmission_category <- ggplot(plot.df, aes(x=Scientific_Name, y=1, fill=transmitter.category)) +
+  geom_tile(alpha=0.7) +
+  #scale_fill_manual(values=c("#f0f0f0", "#c2a5cf", "#5aae61")) +
+  scale_fill_manual(values=c(PARAM$colour.non_transmitter, PARAM$colour.occ_transmitter, PARAM$colour.transmitter)) +
+  scale_x_discrete(limits=as.character(my.data.taxa$Scientific_Name)[order.use], labels=as.character(my.data.taxa$Species)[order.use]) +
+  #coord_flip() +
+  theme_minimal() +
+  theme(
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  )
+p.transmission_category
+```
+
+Transmission categories across all taxa.
+
+```{r}
+plot.df <- my.data.taxa.full
+p.transmission_category.full <- ggplot(plot.df, aes(x=Scientific_Name, y=1, fill=transmitter.category)) +
+  geom_tile(alpha=0.7) +
+  #scale_fill_manual(values=c("#f0f0f0", "#c2a5cf", "#5aae61")) +
+  scale_fill_manual(values=c(PARAM$colour.gut, PARAM$colour.non_transmitter, PARAM$colour.occ_transmitter, PARAM$colour.transmitter, PARAM$colour.saliva)) +
+  scale_x_discrete(limits=as.character(my.data.taxa.full$Scientific_Name)[order.full], labels=as.character(my.data.taxa.full$Species)[order.full]) +
+  #coord_flip() +
+  theme_minimal() +
+  theme(
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  )
+p.transmission_category.full
+```
+
+Test for an association of phenotypes to transmission scores upon phylogenetic regression.
+
+```{r, echo=F}
+library(caper)
+library(effsize)
+
+#Prepare data
+d.data.taxa <- my.data.taxa.full
+d.data.taxa$opp_pathogen <- d.data.taxa$`opportunistic pathogen`
+d.data.taxa$opp_pathogen[!is.na(d.data.taxa$opp_pathogen)] <- "TRUE"
+d.data.taxa$opp_pathogen[is.na(d.data.taxa$opp_pathogen)] <- "FALSE"
+
+d.data.taxa$endocarditis[!is.na(d.data.taxa$endocarditis)] <- "TRUE"
+d.data.taxa$endocarditis[is.na(d.data.taxa$endocarditis)] <- "FALSE"
+
+d.data.taxa$oxygen_req <- d.data.taxa$`Oxygen Requirement`
+d.data.taxa$oxygen_req[d.data.taxa$oxygen_req != "anaerobic"] <- "tolerant"
+
+d.data.taxa$Sporulation[d.data.taxa$Sporulation == "+"] <- "TRUE"
+d.data.taxa$Sporulation[d.data.taxa$Sporulation == "-" | is.na(d.data.taxa$Sporulation)] <- "FALSE"
+
+d.data.taxa$placque <- d.data.taxa$`dental placque`
+d.data.taxa$placque[!is.na(d.data.taxa$placque)] <- "TRUE"
+d.data.taxa$placque[is.na(d.data.taxa$placque)] <- "FALSE"
+
+d.data.taxa$caries <- d.data.taxa$`dental caries`
+d.data.taxa$caries[!is.na(d.data.taxa$caries)] <- "TRUE"
+d.data.taxa$caries[is.na(d.data.taxa$caries)] <- "FALSE"
+
+d.data.taxa$periodontitis[!is.na(d.data.taxa$periodontitis)] <- "TRUE"
+d.data.taxa$periodontitis[is.na(d.data.taxa$periodontitis)] <- "FALSE"
+
+d.data.taxa$CRC <- d.data.taxa$`colorectal cancer`
+d.data.taxa$CRC[!is.na(d.data.taxa$CRC)] <- "TRUE"
+d.data.taxa$CRC[is.na(d.data.taxa$CRC)] <- "FALSE"
+
+#Regenerate updated data structure for caper
+my.tree.full.unfckd <- my.tree.full
+my.tree.full.unfckd$node.label <- seq(1:Nnode(my.tree.full.unfckd))
+d.data.comp <- comparative.data(phy=my.tree.full.unfckd, data=d.data.taxa, names.col='Tax_ID', vcv=T, warn.dropped=T, na.omit=F)
+
+#Fit a PGLS model
+d.data.pgls <- pgls(Z.bg_cohort.all.median ~  genome_size + oxygen_req + opp_pathogen + endocarditis + placque + caries + periodontitis, data = d.data.comp, lambda='ML')
+summary(d.data.pgls)
+d.data.pgls.anova <- anova(d.data.pgls)
+d.data.pgls.anova
+
+#Get non-pgls anova ("naive" anova)
+d.aov <- anova(lm(Z.bg_cohort.all.median ~  genome_size + oxygen_req + opp_pathogen + endocarditis + placque + caries + periodontitis, data = d.data.taxa))
+
+#Put together table of tests for output
+res.pgls.anova <- data.frame(
+  covariate = c("genome_size", "oxygen_req", "opp_pathogen", "endocarditis", "placque", "caries", "periodontitis"),
+  R2 = (d.data.pgls.anova$`Sum Sq` / sum(d.data.pgls.anova$`Sum Sq`))[1:7],
+  p = d.data.pgls.anova$`Pr(>F)`[1:7],
+  R2.naive = (d.aov$`Sum Sq` / sum(d.aov$`Sum Sq`))[1:7],
+  p.naive = d.aov$`Pr(>F)`[1:7],
+  cohen.d = NA,
+  mean.ratio = NA
+)
+covariates <- as.character(res.pgls.anova$covariate)
+for (cv in 2:7) {
+  res.pgls.anova$cohen.d[cv] <- cohen.d(d.data.taxa$Z.bg_cohort.all.median, as.factor(d.data.taxa[, covariates[cv]]), na.rm=T)$estimate
+  res.pgls.anova$mean.ratio[cv] <- mean(d.data.taxa$Z.bg_cohort.all.median[d.data.taxa[, covariates[cv]] %in% c("TRUE", "tolerant")], na.rm=T) / mean(d.data.taxa$Z.bg_cohort.all.median[! d.data.taxa[, covariates[cv]] %in% c("TRUE", "tolerant")], na.rm=T)
+}
+
+capture.output(summary(d.data.pgls), file=paste0(PARAM$folder.results, "taxa_association.host_phenotypes.pgls.txt"))
+capture.output(d.data.pgls.anova, file=paste0(PARAM$folder.results, "taxa_association.host_phenotypes.pgls_anova.txt"))
+capture.output(d.aov, file=paste0(PARAM$folder.results, "taxa_association.host_phenotypes.naive_anova.txt"))
+write.table(res.pgls.anova, file = paste0(PARAM$folder.results, "taxa_association.host_phenotypes.summary.tsv"), col.names = NA, sep="\t")
+```
+
+Generate summary plot on Cohen's d effect sizes (normalized mean differences btw groups).
+
+```{r}
+#Flip Cohen's d values (messed up factor level ordering in previous code chunk, thanks R...)
+res.pgls.anova$cohen.d <- 0 - res.pgls.anova$cohen.d
+plot.df <- res.pgls.anova[res.pgls.anova$covariate %in% c("opp_pathogen", "endocarditis", "placque", "caries", "periodontitis"), ]
+plot.df.null <- plot.df
+plot.df.null$cohen.d <- 0
+
+p.disease_covariates <- ggplot(plot.df, aes(x=covariate, y=cohen.d, group=covariate)) +
+  geom_line(data=rbind(plot.df, plot.df.null), size=0.5, colour="#898989", alpha=1) +
+  geom_point(size=2, colour="#898989", alpha=1) +
+  #scale_colour_manual(values=c("#41ab5d", "#ae017e")) +
+  scale_x_discrete(limits=rev(c("opp_pathogen", "endocarditis", "caries", "placque", "periodontitis"))) +
+  ylim(0,3) +
+  #geom_hline(yintercept = c(0, 0.2, 0.5, 0.8, 1.2), size=0.5, colour="grey") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  ) +
+  NULL
+p.disease_covariates
+
+ggsave(p.disease_covariates, width=7, height=9, units = "cm", filename=paste0(PARAM$folder.base, "manuscript/Figures/Figure_3.diseases/Figure_3.disease_covariates.cohen_d.pdf"), useDingbats=F, dpi=1200)
+```
+
+Taxonomy categories as heatmap.
+
+```{r}
+p.taxonomy_category <- ggplot(my.data.taxa, aes(x=Scientific_Name, y=1, fill=taxonomy.plot)) +
+  geom_tile(alpha=1) +
+  scale_fill_manual(values=c(
+    "#33a02c",
+    "#b2df8a",
+    "#1f78b4",
+    "#a6cee3",
+    "#e31a1c",
+    "#fdbf6f",
+    "#ff7f00",
+    "#fb9a99",
+    "#6a3d9a",
+    "#cab2d6",
+    "#b15928",
+    "#ffff99"
+  )) +
+  scale_x_discrete(limits=as.character(my.data.taxa$Scientific_Name)[order.by_tree], labels=as.character(my.data.taxa$Species)[order.by_tree]) +
+  theme_minimal() +
+  theme(
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  )
+p.taxonomy_category
+```
+
+Transmitter category by class-level taxonomy.
+
+```{r}
+plot.df <- droplevels(my.data.taxa.full)
+plot.df$transmitter.category <- factor(plot.df$transmitter.category, levels=rev(levels(plot.df$transmitter.category)))
+order.category.class <- order(plot.df$Class, plot.df$transmitter.category)
+p.transmission_category.class <- ggplot(plot.df, aes(x=Scientific_Name, y=1, fill=transmitter.category)) +
+  geom_tile(alpha=1) +
+  #scale_fill_manual(values=c("#f0f0f0", "#c2a5cf", "#5aae61")) +
+  scale_fill_manual(values=c(PARAM$colour.saliva, PARAM$colour.transmitter, PARAM$colour.occ_transmitter, PARAM$colour.non_transmitter, PARAM$colour.gut)) +
+  scale_x_discrete(limits=as.character(my.data.taxa.full$Scientific_Name)[order.category.class], labels=as.character(my.data.taxa.full$Species)[order.category.class]) +
+  #coord_flip() +
+  theme_minimal() +
+  theme(
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  ) +
+  NULL
+p.transmission_category.class
+
+ggsave(p.transmission_category.class, width=8, height=0.5, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_1.draft.transmit_cat.by_class.pdf"), useDingbats=F, dpi=1200)
+```
+
+Transmitter category by custom selected taxonomy.
+
+```{r}
+plot.df <- droplevels(my.data.taxa.full)
+plot.df$transmitter.category <- factor(plot.df$transmitter.category, levels=rev(levels(plot.df$transmitter.category)))
+order.category.tax_custom <- order(plot.df$taxonomy.plot, plot.df$transmitter.category)
+p.transmission_category.tax_custom <- ggplot(plot.df, aes(x=Scientific_Name, y=1, fill=transmitter.category)) +
+  geom_tile(alpha=1) +
+  #scale_fill_manual(values=c("#f0f0f0", "#c2a5cf", "#5aae61")) +
+  scale_fill_manual(values=c(PARAM$colour.saliva, PARAM$colour.transmitter, PARAM$colour.occ_transmitter, PARAM$colour.non_transmitter, PARAM$colour.gut)) +
+  scale_x_discrete(limits=as.character(my.data.taxa.full$Scientific_Name)[order.category.tax_custom], labels=as.character(my.data.taxa.full$Species)[order.category.tax_custom]) +
+  #coord_flip() +
+  theme_minimal() +
+  theme(
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  ) +
+  NULL
+p.transmission_category.tax_custom
+
+ggsave(p.transmission_category.tax_custom, width=8, height=0.5, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_1.draft.transmit_cat.by_custom_tax.pdf"), useDingbats=F, dpi=1200)
+```
+
+Alluvial flow plot to connect transmitter category plots (basic to per-phylum)
+
+```{r}
+data.alluvial <- ddply(my.data.taxa.full, .variables = c("Phylum", "transmitter.category"), .fun = function(df) {nrow(df)})
+
+#Force factor ordering to agree with tree (manually)
+data.alluvial$transmitter.category <- factor(data.alluvial$transmitter.category, levels=rev(levels(data.alluvial$transmitter.category)))
+
+#Generate alluvial plot
+p.alluvial <- ggplot(data.alluvial, aes(weight=V1, axis1=Phylum, axis2=transmitter.category)) +
+  geom_alluvium(aes(fill=transmitter.category), reverse=F) +
+  geom_stratum(width=1/8, reverse=F) +
+  #geom_text(stat="stratum", label.strata=T, reverse=F) +
+  scale_fill_manual(values=c(PARAM$colour.saliva, PARAM$colour.transmitter, PARAM$colour.occ_transmitter, PARAM$colour.non_transmitter, PARAM$colour.gut)) +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    axis.text = element_blank(),
+    axis.title = element_blank()
+  )
+p.alluvial
+
+ggsave(p.alluvial, width=12, height=2, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_1.draft.transmit_cat.by_phylum.alluvial.pdf"), useDingbats=F, dpi=1200)
+```
+
+Transmitter category by (selected) families
+
+```{r}
+plot.df <- my.data.taxa.full
+keep.families <- c("Streptococcaceae", "Lachnospiraceae", "Prevotellaceae", "Bacteroidaceae", "Clostridiaceae", "Neisseriaceae", "Veillonellaceae", "Ruminococcaceae", "Eubacteriaceae", "Pasteurellaceae", "Bifidobacteriaceae", "Actinomycetaceae", "Fusobacteriaceae")
+#plot.df$Family[! plot.df$Family %in% keep.families] <- "undef"
+plot.df$Family <- droplevels(plot.df$Family)
+plot.df$transmitter.category <- factor(plot.df$transmitter.category, levels=rev(levels(plot.df$transmitter.category)))
+#plot.df$transmitter.category[plot.df$Family == "undef"] <- NA
+
+order.category.family <- order(plot.df$Phylum, plot.df$Class, plot.df$Family, plot.df$transmitter.category)
+order.category.class <- order(plot.df$Phylum, plot.df$Class, plot.df$transmitter.category)
+
+p.transmission_category.family <- ggplot(plot.df, aes(x=Scientific_Name, y=1, fill=transmitter.category)) +
+  geom_tile(alpha=1) +
+  #scale_fill_manual(values=c("#f0f0f0", "#c2a5cf", "#5aae61")) +
+  scale_fill_manual(values=c(PARAM$colour.saliva, PARAM$colour.transmitter, PARAM$colour.occ_transmitter, PARAM$colour.non_transmitter, PARAM$colour.gut), na.value="white") +
+  scale_x_discrete(limits=as.character(my.data.taxa.full$Scientific_Name)[order.category.family], labels=as.character(my.data.taxa.full$Species)[order.category.family]) +
+  #coord_flip() +
+  theme_minimal() +
+  theme(
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position = "none",
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  ) +
+  NULL
+p.transmission_category.family
+```
+
+Plot average oral and fecal sample composition across transmitter categories
+
+```{r}
+#Break down specI abundances to the level of individual subjects
+specI.oral.tmp <- t(daply(data.timepoint[data.timepoint$paired.saliva_gut & data.timepoint$group != "small_adenoma", ], "subject", function(df) {
+  rowMeans(specI.oral[, as.character(df$sample.oral), drop=FALSE], na.rm=T)
+}))
+specI.gut.tmp <- t(daply(data.timepoint[data.timepoint$paired.saliva_gut & data.timepoint$group != "small_adenoma", ], "subject", function(df) {
+  rowMeans(specI.gut[, as.character(df$sample.gut), drop=FALSE], na.rm=T)
+}))
+specI.oral.avg <- rowMeans(specI.oral.tmp, na.rm=T)
+specI.gut.avg <- rowMeans(specI.gut.tmp, na.rm=T)
+
+specI.oral.avg.trans_cat <- ddply(my.data.taxa.fullest, .variables = c("transmitter.category"), .fun = function(df) {data.frame(site="oral", abd = sum(specI.oral.avg[as.character(df$Tax_ID)]))})
+specI.gut.avg.trans_cat <- ddply(my.data.taxa.fullest, .variables = c("transmitter.category"), .fun = function(df) {data.frame(site="gut", abd = sum(specI.gut.avg[as.character(df$Tax_ID)]))})
+
+specI.avg.trans_cat <- rbind(specI.oral.avg.trans_cat, specI.gut.avg.trans_cat, data.frame(transmitter.category="unclassified", site=c("oral", "gut"), abd=c(1 - sum(specI.oral.avg.trans_cat$abd), 1 - sum(specI.gut.avg.trans_cat$abd))))
+specI.avg.trans_cat$transmitter.category <- factor(specI.avg.trans_cat$transmitter.category, levels = c(
+  "unclassified",
+  "predominantly fecal",
+  "non-transmitter",
+  "occasional transmitter",
+  "transmitter",
+  "predominantly oral"
+))
+
+p.avg_composition <- ggplot(specI.avg.trans_cat, aes(x=site, y=abd, fill=transmitter.category)) +
+  geom_bar(stat="identity", position="stack") +
+  scale_fill_manual(values = c("grey", PARAM$colour.gut, PARAM$colour.non_transmitter, PARAM$colour.occ_transmitter, PARAM$colour.transmitter, PARAM$colour.saliva)) +
+  scale_x_discrete(limits=c("gut", "oral")) +
+  ylim(0,1) +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text = element_text()
+  ) +
+  NULL
+p.avg_composition
+
+ggsave(p.avg_composition, width=16, height=10, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_1.draft.avg_composition.trans_cat.pdf"), useDingbats=F, dpi=1200)
+
+```
+
+Plot S figure on correlations of transmission scores with technical parameters.
+
+```{r}
+plot.df <- ddply(my.data.detect_transmission, "Taxon", function(df) {
+  data.frame(
+    hor_cov.saliva = cor(df$S.z.bg_cohort.all, df$hor_cov.site_1, use = "complete.obs", method="spearman"),
+    hor_cov.stool = cor(df$S.z.bg_cohort.all, df$hor_cov.site_2, use = "complete.obs", method="spearman"),
+    ver_cov.saliva = cor(df$S.z.bg_cohort.all, df$ver_cov.site_1, use = "complete.obs", method="spearman"),
+    ver_cov.stool = cor(df$S.z.bg_cohort.all, df$ver_cov.site_2, use = "complete.obs", method="spearman"),
+    abd.saliva = cor(df$S.z.bg_cohort.all, df$abd.site_1, use = "complete.obs", method="spearman"),
+    abd.stool = cor(df$S.z.bg_cohort.all, df$abd.site_2, use = "complete.obs", method="spearman"),
+    pos_obs.saliva = cor(df$S.z.bg_cohort.all, df$n.obs.site_1, use = "complete.obs", method="spearman"),
+    pos_obs.stool = cor(df$S.z.bg_cohort.all, df$n.obs.site_2, use = "complete.obs", method="spearman"),
+    pos_obs.shared = cor(df$S.z.bg_cohort.all, df$n.obs.shared, use = "complete.obs", method="spearman")
+  )
+})
+
+plot.df <- melt(plot.df, id.vars = "Taxon")
+plot.df$variable <- factor(plot.df$variable, levels = rev(c("hor_cov.saliva", "hor_cov.stool", "ver_cov.saliva", "ver_cov.stool", "abd.saliva", "abd.stool", "pos_obs.saliva", "pos_obs.stool", "pos_obs.shared")))
+
+p.technical_parameters <- ggplot(plot.df, aes(x=variable, y=value)) +
+  geom_jitter(size=0.5, alpha=0.7, colour="grey", width=0.2) +
+  geom_boxplot(fill=NA, colour="black", outlier.colour=NA) +
+  geom_point(data=aggregate(value ~ variable, median, data=plot.df), size=2, colour="black") +
+  geom_hline(yintercept = 0) +
+  xlab("Technical Parameter") +
+  ylab("Spearman Correlation to Transmission Score per Taxon") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(family="Helvetica", size=4),
+    axis.title = element_text(family="Helvetica", size=6),
+    panel.grid.minor.x = element_blank(),
+    #panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    #panel.grid.major.x = element_blank(),
+    legend.position = "none"
+  ) +
+  NULL
+p.technical_parameters
+
+ggsave(p.technical_parameters, width=12, height=12, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_SX.correlation_to_technical_parameters.pdf"), useDingbats=F, dpi=1200)
+```
+
+Plot S figure on relative enrichment of fecal abd and depth over physiological expecations ("passive" transmission).
+
+```{r}
+#Melt matrices into a data.frame
+res.enrichment <- melt(abd.gut.enrichment, na.rm=T, varnames=c("TaxID", "subject"), value.name="enrichment")
+res.enrichment$type <- "abundance"
+tmp.enrichment <- melt(depth.gut.enrichment, na.rm=T, varnames=c("TaxID", "subject"), value.name="enrichment")
+tmp.enrichment$type <- "vertical coverage"
+res.enrichment <- rbind(res.enrichment, tmp.enrichment)
+
+res.enrichment <- res.enrichment[res.enrichment$TaxID %in% as.character(my.data.taxa.full$Tax_ID), ]
+res.enrichment$Taxon <- my.data.taxa.full$Scientific_Name[match(res.enrichment$TaxID, as.character(my.data.taxa.full$Tax_ID))]
+res.enrichment$transmitter.category <- my.data.taxa.full$transmitter.category[match(res.enrichment$TaxID, as.character(my.data.taxa.full$Tax_ID))]
+
+plot.dt <- my.data.taxa.full
+tmp.median_enrichment <- aggregate(enrichment ~ TaxID + Taxon + type + transmitter.category, data=res.enrichment, median, na.rm=T)
+plot.dt$enrichment.median <- tmp.median_enrichment$enrichment[match(as.character(plot.dt$Tax_ID), as.character(tmp.median_enrichment$TaxID))]
+order.enrichment <- order(plot.dt$transmitter.category, plot.dt$enrichment.median, decreasing = T)
+
+p.enrichment <- ggplot(res.enrichment, aes(x=Taxon, y=enrichment, colour=transmitter.category)) +
+  geom_jitter(width=0.2, size=0.2, alpha=0.4, colour="grey") +
+  geom_point(data=aggregate(enrichment ~ Taxon + type + transmitter.category, data=res.enrichment, median, na.rm=T), alpha=1, size=1) +
+  scale_x_discrete(limits=rev(as.character(my.data.taxa.full$Scientific_Name)[order.enrichment]), labels=rev(as.character(my.data.taxa.full$Species)[order.enrichment])) +
+  scale_colour_manual(values = c(PARAM$colour.gut, PARAM$colour.non_transmitter, PARAM$colour.occ_transmitter, PARAM$colour.transmitter, PARAM$colour.saliva)) +
+  geom_hline(yintercept = 0) +
+  ylab("log2(enrichment relative to physiological exepectation)") +
+  facet_grid(. ~ type) +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    axis.title.y = element_blank(),
+    axis.title.x = element_text(family="Helvetica", size=5),
+    axis.text = element_text(family="Helvetica", size=3)
+  ) +
+  NULL
+p.enrichment
+
+#Store
+ggsave(p.enrichment, width=25, height=25, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_SX.enrichment.pdf"), useDingbats=F, dpi=1200)
+```
+
+Plot an S figure on the longitudinal stability of taxa in saliva and stool.
+
+```{r}
+plot.df <- data.stability[data.stability$site %in% c("saliva", "stool") & data.stability$Tax_ID %in% my.data.taxa.full$Tax_ID, ]
+plot.df$transmitter.category <- my.data.taxa.full$transmitter.category[match(as.character(plot.df$Tax_ID), as.character(my.data.taxa.full$Tax_ID))]
+
+plot.dt <- my.data.taxa.full
+tmp.median_Z <- aggregate(allele.overlap.Z ~ Tax_ID + Taxon + site + transmitter.category, data=plot.df, median, na.rm=T)
+plot.dt$stability.median <- tmp.median_Z$allele.overlap.Z[match(as.character(plot.dt$Tax_ID), as.character(tmp.median_Z$Tax_ID))]
+order.stability <- order(plot.dt$transmitter.category, plot.dt$stability.median, decreasing = T)
+
+p.stability <- ggplot(plot.df, aes(x=Taxon, y=allele.overlap.Z, colour=transmitter.category)) +
+  geom_jitter(width=0.2, size=0.2, alpha=0.4, colour="grey") +
+  geom_point(data=aggregate(allele.overlap.Z ~ Taxon + site + transmitter.category, data=plot.df, median, na.rm=T), alpha=1, size=1) +
+  scale_x_discrete(limits=rev(as.character(my.data.taxa.full$Scientific_Name)[order.stability]), labels=rev(as.character(my.data.taxa.full$Species)[order.stability])) +
+  ylim(-5, 5) +
+  scale_colour_manual(values = c(PARAM$colour.gut, PARAM$colour.non_transmitter, PARAM$colour.occ_transmitter, PARAM$colour.transmitter, PARAM$colour.saliva)) +
+  geom_hline(yintercept = 0) +
+  ylab("Longitudinal SNV similarity (Z-scored)") +
+  facet_grid(. ~ site) +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    axis.title.y = element_blank(),
+    axis.title.x = element_text(family="Helvetica", size=5),
+    axis.text = element_text(family="Helvetica", size=3)
+  ) +
+  NULL
+p.stability
+
+ggsave(p.stability, width=25, height=25, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_SX.longitudinal_stability.pdf"), useDingbats=F, dpi=1200)
+```
+
+
+Transmission scores per taxon.
+
+```{r}
+plot.df <- my.data.detect_transmission[, c("Taxon", "S.z.bg_cohort.all", "S.z.bg_cohort.all.p.adj")]
+plot.df$logP <- -log10(plot.df$S.z.bg_cohort.all.p.adj)
+plot.df$logP[plot.df$logP == Inf] <- max(plot.df$logP[is.finite(plot.df$logP)])
+p.transmission_scores <- ggplot(plot.df, aes(x=Taxon, y=S.z.bg_cohort.all, colour=logP, alpha=logP)) +
+  geom_jitter(size=0.3, width = 0.3) +
+  geom_point(data=my.data.taxa, aes(x=Scientific_Name, y=Z.bg_cohort.all.median), size=1, colour="black", alpha=1) +
+  scale_alpha_continuous(range=c(0.2, 0.9), limits=c(0,8)) +
+  scale_colour_gradientn(colours=c("#bdbdbd", "#a1d99b", "#00441b"), values=c(0, -log10(0.05), 6) / 6) +
+  ylab("Transmission Score") +
+  geom_hline(yintercept=0, size=0.2, alpha=0.6) +
+  # geom_hline(yintercept=1.645, size=0.2, alpha=0.6) +
+  # geom_hline(yintercept=2.33, size=0.2, alpha=0.6) +
+  # geom_hline(yintercept=3.09, size=0.2, alpha=0.6) +
+  scale_y_continuous(breaks=c(qnorm(0.01), qnorm(0.1), 0, -qnorm(10^(seq(-1, -23, by=-1)))), limits = c(-2.33, 10)) +
+  #scale_x_discrete(limits=rev(levels(my.data.taxa$Scientific_Name))) +
+  scale_x_discrete(limits=as.character(my.data.taxa$Scientific_Name)[order.use], labels=as.character(my.data.taxa$Species)[order.use]) +
+  #coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text=element_blank(),
+    axis.title = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    #panel.grid.major.x = element_blank(),
+    legend.position = "none"
+  )
+p.transmission_scores
+```
+
+Plot normal distribution to illustrate background.
+
+```{r}
+p.background <- ggplot(data=data.frame(x=c(-2.33, 10)), aes(x)) +
+  stat_function(fun=dnorm, n=300, args=list(mean=0, sd=1), geom="area", aes(fill=x)) +
+  scale_y_reverse() +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text=element_blank(),
+    axis.title = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    #panel.grid.major.x = element_blank(),
+    legend.position = "none"
+  )
+p.background
+#Store
+ggsave(p.background, width=2, height=8, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_1.draft.panel_bg_scores.pdf"), useDingbats=F, dpi=1200)
+```
+
+Estimate transmission rates per taxon:
+* estimate total turnover within site (saliva or stool) over time
+* estimate the fraction of turnover that can be accounted for by transmission (alleles observed at `t0` in the coupled site)
+
+```{r, fig.height = 6, fig.width = 8}
+p.turnover.raw <- ggplot(my.data.rates, aes(x=Taxon, y=turnover, colour=source_sink)) +
+  geom_jitter(alpha = 0.6, width = 0.2) +
+  scale_color_manual(values=c(PARAM$colour.gut, PARAM$colour.saliva)) +
+  scale_x_discrete(limits=as.character(my.data.taxa$Scientific_Name)[order.use], labels=as.character(my.data.taxa$Species)[order.use]) +
+  facet_grid(source_sink ~ .) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(size=4, family="Helvetica")
+  ) +
+  NULL
+p.turnover.raw
+```
+
+Plot Z scores on turnover vs different backgrounds.
+
+```{r, fig.width=4, fig.height=3}
+data.turnover <- ddply(my.data.rates, .variables = c("source_sink", "Taxon", "delta_t.bin", "subject"), .fun = function(df) {
+  data.frame(
+    Z.bg_coupled = mean(df$Z.bg_coupled, na.rm=T),
+    Z.bg_longit = mean(df$Z.bg_longit, na.rm=T)
+  )
+})
+data.turnover <- droplevels(data.turnover)
+data.turnover.melt <- melt(data.turnover, id.vars = c("source_sink", "Taxon", "delta_t.bin", "subject"))
+data.turnover.Z_summary <- ddply(data.turnover, .variables = c("source_sink", "Taxon", "delta_t.bin"), .fun = function(df) {
+  data.frame(
+    Z.bg_coupled = median(df$Z.bg_coupled, na.rm=T),
+    Z.bg_longit = median(df$Z.bg_longit, na.rm=T)
+  )
+})
+data.turnover.Z_summary$transmitter.category <- my.data.taxa$transmitter.category[match(as.character(data.turnover.Z_summary$Taxon), as.character(my.data.taxa$Scientific_Name))]
+data.turnover.Z_summary.melt <- melt(data.turnover.Z_summary, id.vars = c("source_sink", "Taxon", "delta_t.bin", "transmitter.category"))
+
+p.turnover.Z <- ggplot(data.turnover.Z_summary[data.turnover.Z_summary$source_sink == "saliva_to_stool",], aes(x=Taxon, y=Z.bg_longit, colour=transmitter.category, group=source_sink)) +
+  geom_hline(yintercept = 0, colour="grey", size=0.8) +
+  geom_line(colour="#f0f0f0", alpha=0.6, size=0.5) +
+  geom_smooth(se=F, colour=PARAM$colour.transmitter, size=0.8, method="loess", method.args=list(span=0.8, degree=1)) +
+  geom_point(size=1, colour="black") +
+  scale_x_discrete(limits=as.character(my.data.taxa$Scientific_Name)[order.by_category], labels=as.character(my.data.taxa$Species)[order.by_category]) +
+  scale_color_manual(values = c(PARAM$colour.non_transmitter, PARAM$colour.occ_transmitter, PARAM$colour.transmitter)) +
+  theme_minimal() +
+  theme(
+    axis.text=element_blank(),
+    axis.title = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    #panel.grid.major.x = element_blank(),
+    legend.position = "none"
+  ) +
+  NULL
+p.turnover.Z
+
+ggsave(p.turnover.Z, width=13, height=2, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_1.draft.turnover_transmission.Z_score_deg1.pdf"), useDingbats=F, dpi=1200)
+```
+
+Generate scatter-line plot of Z scores.
+
+```{r}
+plot.df <- data.turnover.Z_summary[data.turnover.Z_summary$source_sink == "saliva_to_stool",]
+plot.df$transmitter.category <- my.data.taxa$transmitter.category[match(as.character(plot.df$Taxon), as.character(my.data.taxa$Scientific_Name))]
+p.turnover.Z.summary <- ggplot(plot.df, aes(x=Taxon, y=Z.bg_longit, group=source_sink, colour=Z.bg_longit)) +
+  geom_point(size=2) +
+  #geom_line(colour="grey") +
+  geom_smooth(se=F, method="loess", colour="grey") +
+  scale_colour_gradient2(low = PARAM$colour.non_transmitter, mid = "#f0f0f0", high = PARAM$colour.transmitter, midpoint = 0, space = "Lab", limits=c(-2.33, 2.33)) +
+  scale_x_discrete(limits=as.character(my.data.taxa$Scientific_Name)[order.use], labels=as.character(my.data.taxa$Species)[order.use]) +
+  scale_y_continuous(breaks=c(qnorm(0.01), qnorm(0.1), 0, -qnorm(10^(seq(-1, -2, by=-1)))), limits = c(-1.3, 2.33)) +
+  geom_hline(yintercept = 0) +
+  theme_minimal() +
+  theme(
+    axis.text=element_blank(),
+    axis.title = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    #panel.grid.major.x = element_blank(),
+    legend.position = "none"
+  ) +
+  NULL
+p.turnover.Z.summary
+```
+
+
+
+
+
+
+

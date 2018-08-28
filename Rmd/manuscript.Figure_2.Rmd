@@ -1,0 +1,1424 @@
+---
+title: 'Figure 2: Transmission per Individual'
+author: "Sebastian Schmidt"
+date: "5/17/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Prepare Environment
+
+Attach relevant packages
+
+```{r}
+library("Matrix", warn.conflicts=F, quietly=T)
+library("readxl", warn.conflicts=F, quietly=T)
+library("plyr", warn.conflicts=F, quietly=T)
+library("dplyr", warn.conflicts=F, quietly=T)
+library("reshape2", warn.conflicts=F, quietly=T)
+library("ggplot2", warn.conflicts=F, quietly=T)
+library("ggalluvial", warn.conflicts=F, quietly=T)
+library("gridExtra", warn.conflicts=F, quietly=T)
+library("cowplot", warn.conflicts=F, quietly=T)
+library("extrafont", warn.conflicts=F, quietly=T)
+library("RColorBrewer", warn.conflicts=F, quietly=T)
+```
+
+Set parameters.
+
+```{r}
+PARAM <- list()
+PARAM$folder.R <- paste0(getwd(), "/")
+PARAM$folder.base <- gsub("Rmd/", "", PARAM$folder.R)
+PARAM$folder.data <- paste0(PARAM$folder.base, "data/")
+PARAM$folder.parameters <- paste0(PARAM$folder.base, "parameters/")
+PARAM$folder.results <- paste0(PARAM$folder.base, "results/")
+PARAM$folder.results_detection <- paste0(PARAM$folder.results, "detect.transmission/")
+PARAM$folder.results_quantification <- paste0(PARAM$folder.results, "quantify.transmission/")
+PARAM$folder.results_directionality <- paste0(PARAM$folder.results, "establish.directionality/")
+PARAM$folder.manuscript.figure <- paste0(PARAM$folder.base, "manuscript/Figures/Figure_2.subject_summary/")
+#=> taxa metadata (based on PATRIC)
+PARAM$file.data_taxa_PATRIC <- paste0(PARAM$folder.parameters, "taxa_metadata.PATRIC_plus.20171017.310.xlsx")
+#Number of cores for parallel processing
+PARAM$use.cores <- 4
+
+#Colors to match individual categories
+PARAM$colour.saliva <- "#08519c"
+PARAM$colour.plaque <- "#c51b7d"
+PARAM$colour.gut <- "#fd8d3c"
+
+#Colours to match transmitter categories
+PARAM$colour.transmitter <- "#33a02c"
+PARAM$colour.occ_transmitter <- "#b2df8a"
+PARAM$colour.non_transmitter <- "#a6cee3"
+```
+
+Load data
+
+```{r}
+#Load sample data
+load(paste0(PARAM$folder.parameters, "data.sample.RData"))
+#Load timepoint data
+load(paste0(PARAM$folder.parameters, "data.timepoint.RData"))
+#Load taxa data
+load(paste0(PARAM$folder.data, "data.taxa.SNV.RData"))
+#Load specI abundance data
+load(paste0(PARAM$folder.data, "data.specI.RData"))
+#Load coverage data
+load(paste0(PARAM$folder.data, "data.coverage.RData"))
+#Load taxonomy data
+load(paste0(PARAM$folder.data, "data.taxonomy.RData"))
+#Load phylogeny
+load(paste0(PARAM$folder.data, "data.tree.RData"))
+#Load relative enrichment data
+load(paste0(PARAM$folder.data, "data.enrichment.RData"))
+#Load transmission detection results
+load(paste0(PARAM$folder.results, "data.detect.transmission.RData"))
+#Load transmission quantification results
+load(paste0(PARAM$folder.results, "data.quantify.transmission.RData"))
+#Load transmission directionality data
+load(paste0(PARAM$folder.results, "data.directionality.RData"))
+#Load transmission rates data
+load(paste0(PARAM$folder.results, "data.transmission_rates.RData"))
+```
+
+Parse taxa annotations and re-filter all data structures.
+
+```{r}
+#Read manually curated taxa metadata from XLSX
+data.taxa.PATRIC.xlsx <- as.data.frame(read_xlsx(PARAM$file.data_taxa_PATRIC, sheet=1))
+
+#Sub-select data.taxa.transmission on saliva <-> gut only (the other site combinations are not relevant for this figure)
+my.data.taxa.transmission <- data.taxa.transmission[["saliva_gut"]]
+
+#Set row.names for data.taxa.PATRIC, data.taxa.transmission and data.taxa
+rownames(data.taxa.PATRIC.xlsx) <- data.taxa.PATRIC.xlsx$`NCBI Taxon ID`
+rownames(my.data.taxa.transmission) <- as.character(my.data.taxa.transmission$Tax_ID)
+rownames(data.taxa) <- data.taxa$Tax_ID
+
+#Force re-order PATRIC and transmission data to match data.taxa
+data.taxa.PATRIC.xlsx <- data.taxa.PATRIC.xlsx[match(rownames(data.taxa), rownames(data.taxa.PATRIC.xlsx)), ]
+my.data.taxa.transmission <- my.data.taxa.transmission[match(rownames(data.taxa), rownames(my.data.taxa.transmission)), ]
+
+#Concatenate both datasets
+my.data.taxa <- cbind(data.taxa, data.taxa.PATRIC.xlsx[, !colnames(data.taxa.PATRIC.xlsx) %in% colnames(data.taxa)])
+my.data.taxa <- cbind(my.data.taxa, my.data.taxa.transmission[, !colnames(my.data.taxa.transmission) %in% colnames(my.data.taxa)])
+
+#Make local copies of the remaining result frames
+my.data.detect_transmission <- droplevels(data.detect_transmission[data.detect_transmission$coupled.sites == "saliva_gut", ])
+my.data.quantify_transmission <- data.quantify_transmission
+
+#Infer sex for Fijians
+data.sample$sex[data.sample$sex == "female"] <- "F"
+data.sample$sex[data.sample$sex == "male"] <- "M"
+data.sample$sex[data.sample$cohort == "FijiCOMP"] <- "M"
+data.sample$sex[data.sample$cohort == "FijiCOMP"][grep('W', as.character(data.sample$subject[data.sample$cohort == "FijiCOMP"]), perl=T, ignore.case=F)] <- "F"
+data.sample$sex <- droplevels(data.sample$sex)
+```
+
+## Process Data
+
+First, process transmission quantification data: what is the fraction of transmitted / transmissibile abundance per individual?
+
+The following definitions are used.
+
+*potential transmitter*: a taxon observed as a global transmitter (globally significant p-value) or as a transmitter at least in some individuals.
+*realised transmitter*: (globally) transmissible taxon with a non-zero abundance in coupled samples per indivudal (observed in both mouth and gut).
+*transmissibile abundance*: total oral/fecal abundance of transmissible taxa.
+*transmitted abundance*: abundance of "realised" transmission per subject, i.e. of global transmitters or of locally significant transmitters, normalized by fraction of shared mSNVs.
+
+In a first step, normalize transmitted/non-transmitted abundances per taxon and individual from `data.quantification`: multiply specI abundances by fraction of oral-gut shared mSNVs.
+
+```{r}
+#Re-scale relative abundances to classifiable abundance only
+size.sample.rel <- colSums(data.specI.rel)
+my.data.quantify_transmission$specI.saliva <- my.data.quantify_transmission$specI.saliva / size.sample.rel[as.character(my.data.quantify_transmission$sample.saliva)]
+my.data.quantify_transmission$specI.stool <- my.data.quantify_transmission$specI.stool / size.sample.rel[as.character(my.data.quantify_transmission$sample.stool)]
+
+#Get normalized transmitted/non-transmitted abundances per taxon and individual
+#=> normalisation by fraction of shared mSNVs
+my.data.quantify_transmission$transmitted_abd.in_stool <- my.data.quantify_transmission$f.aSNV.shared.saliva_stool * my.data.quantify_transmission$specI.stool
+my.data.quantify_transmission$non_transmitted_abd.in_stool <- (1 - my.data.quantify_transmission$f.aSNV.shared.saliva_stool) * my.data.quantify_transmission$specI.stool
+my.data.quantify_transmission$transmitted_abd.in_saliva <- my.data.quantify_transmission$f.aSNV.shared.saliva_stool * my.data.quantify_transmission$specI.saliva
+my.data.quantify_transmission$non_transmitted_abd.in_saliva <- (1 - my.data.quantify_transmission$f.aSNV.shared.saliva_stool) * my.data.quantify_transmission$specI.saliva
+```
+
+
+```{r}
+#Filter for taxa with sufficient data for dependable transmission detection
+curr.n_proc <- ddply(data.detect_transmission, "Taxon", nrow)
+keep.by_detectability <- curr.n_proc$Taxon[curr.n_proc$V1 > 20]
+
+#Filter taxa by prevalence in oral and gut samples
+keep.by_prevalence <- my.data.taxa$prevalence.saliva > 0.1 & my.data.taxa$prevalence.gut > 0.1
+
+#Filter by availability of transmission score data
+#=> minimum number of scored individuals
+keep.by_transmission_scores <- !is.na(my.data.taxa$Z.bg_cohort.all.mean)
+
+#Subset by combining these filters
+keep.taxa <- as.character(my.data.taxa$Tax_ID)[keep.by_prevalence & my.data.taxa$Scientific_Name %in% keep.by_detectability]
+keep.taxa <- as.character(my.data.taxa$Tax_ID)[keep.by_transmission_scores]
+
+my.data.taxa <- droplevels(my.data.taxa[keep.taxa, ])
+
+my.data.rates <- droplevels(data.rates[data.rates$Tax_ID %in% keep.taxa & !is.na(data.rates$delta_t.bin), ])
+tmp.data.rates <- rbind(data.rates[, colnames(data.rates) %in% colnames(data.rates.bg)], data.rates.bg)
+my.data.rates.full <- droplevels(tmp.data.rates[tmp.data.rates$Tax_ID %in% keep.taxa & !is.na(tmp.data.rates$delta_t.bin), ])
+my.data.rates.full$delta_t.bin <- factor(my.data.rates.full$delta_t.bin, levels = c("intra.indiv", "bg.coupled", "bg.longitudinal"))
+
+#Subset specI abundance tables and report rel abd represented by selected taxa
+sub.specI.oral <- data.specI.rel[keep.taxa, rownames(data.sample)[data.sample$material == "saliva"]]
+sub.specI.gut <- data.specI.rel[keep.taxa, rownames(data.sample)[data.sample$material == "stool"]]
+```
+
+Next, define taxa which are global or occasional transmitters (in some individuals only).
+
+```{r}
+transmitting_taxa <- as.character(my.data.taxa$Scientific_Name)[my.data.taxa$transmitter == T & !is.na(my.data.taxa$transmitter)]
+
+tmp <- ddply(data.detect_transmission[data.detect_transmission$coupled.sites == "saliva_gut", ], "Taxon", function(df) {
+  data.frame(
+    transmitted.in_subjects = sum(df$S.z.bg_cohort.all.p.adj < 0.05)
+  )
+})
+my.data.taxa <- my.data.taxa[as.character(my.data.taxa$Scientific_Name) %in% as.character(tmp$Taxon), ]
+my.data.taxa[match(as.character(my.data.taxa$Scientific_Name), as.character(tmp$Taxon)), "transmitted.in_subjects"] <- tmp$transmitted.in_subjects
+my.data.taxa$transmitter.in_some <- my.data.taxa$transmitted.in_subjects > 0
+transmitting_in_some <- as.character(my.data.taxa$Scientific_Name)[my.data.taxa$transmitter.in_some & !is.na(my.data.taxa$transmitter.in_some) & !my.data.taxa$transmitter]
+
+my.data.taxa$transmitter.category <- ""
+my.data.taxa$transmitter.category[my.data.taxa$prevalence.gut >= 0.1 & my.data.taxa$prevalence.saliva <= 0.1] <- "predominantly fecal"
+my.data.taxa$transmitter.category[my.data.taxa$prevalence.gut <= 0.1 & my.data.taxa$prevalence.saliva >= 0.1] <- "predominantly oral"
+my.data.taxa$transmitter.category[my.data.taxa$prevalence.gut > 0.1 & my.data.taxa$prevalence.saliva > 0.1 & !my.data.taxa$transmitter] <- "non-transmitter"
+my.data.taxa$transmitter.category[my.data.taxa$transmitter.in_some] <- "occasional transmitter"
+my.data.taxa$transmitter.category[my.data.taxa$transmitter] <- "transmitter"
+my.data.taxa$transmitter.category <- factor(my.data.taxa$transmitter.category, levels=rev(c("predominantly oral", "transmitter", "occasional transmitter", "non-transmitter", "predominantly fecal")))
+```
+
+Summarise transmission quantification data per subject:
+* number of potential and realised transmitters in oral & gut samples
+* transmissible and transmitted abundance per oral & gut sample
+
+```{r}
+#Get subject annotations per subject_timepoint in data.quantification
+my.data.quantify_transmission$subject <- data.timepoint[as.character(my.data.quantify_transmission$subject_timepoint), "subject"]
+my.data.quantify_transmission$family <- data.timepoint[as.character(my.data.quantify_transmission$subject_timepoint), "family"]
+my.data.quantify_transmission$cohort <- data.timepoint[as.character(my.data.quantify_transmission$subject_timepoint), "cohort"]
+my.data.quantify_transmission$group <- data.timepoint[as.character(my.data.quantify_transmission$subject_timepoint), "group"]
+
+#Prepare data on transmission detection (insert subject.timepoint factor)
+my.data.detect_transmission$subject_timepoint <- paste(my.data.detect_transmission$subject, my.data.detect_transmission$timepoint, sep=".")
+
+#Pre-compute oral and fecal abundances of potential transmitters (occasional and frequent) per subject.timepoint
+specI.oral <- t(t(data.specI.rel[, data.sample$material == "saliva"]) / colSums(data.specI.rel[, data.sample$material == "saliva"]))
+specI.gut <- t(t(data.specI.rel[, data.sample$material == "stool"]) / colSums(data.specI.rel[, data.sample$material == "stool"]))
+specI.oral.s_t <- colSums(specI.oral[as.character(my.data.taxa$Tax_ID)[my.data.taxa$transmitter.category %in% c("transmitter", "occasional transmitter")], data.timepoint$sample.oral[data.timepoint$paired.saliva_gut]])
+specI.gut.s_t <- colSums(specI.gut[as.character(my.data.taxa$Tax_ID)[my.data.taxa$transmitter.category %in% c("transmitter", "occasional transmitter")], data.timepoint$sample.gut[data.timepoint$paired.saliva_gut]])
+
+#Get preliminiary summarised quantification data
+quant.summary <- ddply(my.data.quantify_transmission, "subject_timepoint", function(df) {
+  #Get current subject_timepoint
+  s_t <- as.character(df$subject_timepoint)[1]
+  
+  #Get current detect_transmission data
+  curr.detect <- my.data.detect_transmission[my.data.detect_transmission$subject_timepoint == s_t, ]
+  curr.detect <- curr.detect[match(as.character(df$Tax_ID), curr.detect$Tax_ID), ]
+  
+  #Get "realised" transmitters: global transmitters w/ paired obs >0 in ST and/or locally significant transmitters
+  curr.transmit.realised <- 
+    df$specI.saliva > 0 &
+    df$specI.stool > 0 &
+    ((as.character(df$Scientific_Name) %in% transmitting_taxa) | (!is.na(curr.detect$S.z.bg_cohort.all.p.adj) & curr.detect$S.z.bg_cohort.all.p.adj < 0.05))
+  
+  #Get "potential" transmitters: taxa transmitting constitutively or in some individuals, but not necessarily in the present subject
+  curr.transmit.potential <-
+    df$specI.saliva > 0 &
+    (as.character(df$Scientific_Name) %in% transmitting_taxa | as.character(df$Scientific_Name) %in% transmitting_in_some)
+  curr.transmit.potential.stool <- 
+    df$specI.stool > 0 &
+    (as.character(df$Scientific_Name) %in% transmitting_taxa | as.character(df$Scientific_Name) %in% transmitting_in_some)
+  
+  #Get total saliva and stool observed taxa count
+  curr.n_saliva <- sum(df$specI.saliva > 0, na.rm=T)
+  curr.n_stool <- sum(df$specI.stool > 0, na.rm=T)
+  
+  #Get current total oral-fecal allele overlap
+  curr.aSNV.overlap.raw <- sum(df$n.aSNV.shared.saliva_stool, na.rm=T) / sum(df$n.aSNV.obs.total.saliva_stool, na.rm=T)
+  curr.aSNV.overlap <- sum(df$n.aSNV.shared.saliva_stool, na.rm=T) / sum(df$n.aSNV.obs.shared.saliva_stool, na.rm=T)
+  
+  #Sum total saliva and stool abundance accounted for by SNV overlap
+  #=> requiring at least 100 SNVs w/ shared observations
+  curr.abd.saliva.overlap <- sum(df$transmitted_abd.in_saliva[df$n.aSNV.obs.shared.saliva_stool >= 100], na.rm=T)
+  curr.abd.stool.overlap <- sum(df$transmitted_abd.in_stool[df$n.aSNV.obs.shared.saliva_stool >= 100], na.rm=T)
+  
+  #Sum salivary and fecal realised transmitted abundance
+  curr.abd.saliva.realised <- sum(df$transmitted_abd.in_saliva[curr.transmit.realised], na.rm=T)
+  curr.abd.stool.realised <- sum(df$transmitted_abd.in_stool[curr.transmit.realised], na.rm=T)
+  
+  #Get salivary and fecal potential (non-realised) transmission
+  #curr.abd.saliva.potential <- sum(df$non_transmitted_abd.in_saliva[curr.transmit.realised], na.rm=T) + sum(df$specI.saliva[curr.transmit.potential & !curr.transmit.realised], na.rm=T)
+  #curr.abd.stool.potential <- sum(df$non_transmitted_abd.in_stool[curr.transmit.realised], na.rm=T) + sum(df$specI.stool[curr.transmit.potential & !curr.transmit.realised], na.rm=T)
+  curr.abd.saliva.potential <- specI.oral.s_t[as.character(df$sample.saliva[1])] - curr.abd.saliva.realised
+  curr.abd.stool.potential <- specI.gut.s_t[as.character(df$sample.stool[1])] - curr.abd.stool.realised
+  
+  #Get salivary and fecal non-transmitting abundance
+  curr.abd.saliva.non_transmitted <- 1 - curr.abd.saliva.realised - curr.abd.saliva.potential
+  curr.abd.stool.non_transmitted <- 1 - curr.abd.stool.realised - curr.abd.stool.potential
+  
+  data.frame(
+    subject = as.character(df$subject)[1],
+    family = as.character(df$family)[1],
+    cohort = as.character(df$cohort)[1],
+    group = as.character(df$group)[1],
+    sex = data.sample[data.sample$subject_timepoint == s_t, "sex"][1],
+    age = data.sample[data.sample$subject_timepoint == s_t, "age"][1],
+    bmi = data.sample[data.sample$subject_timepoint == s_t, "bmi"][1],
+    n_obs.shared = sum(df$n.aSNV.obs.shared.saliva_stool, na.rm=T),
+    aSNV.overlap.raw = curr.aSNV.overlap.raw,
+    aSNV.overlap.total = curr.aSNV.overlap,
+    n.saliva = curr.n_saliva,
+    n.stool = curr.n_stool,
+    n.realised = sum(curr.transmit.realised),
+    n.potential = sum(curr.transmit.potential),
+    n.potential.stool = sum(curr.transmit.potential.stool),
+    abd.saliva.overlap = curr.abd.saliva.overlap,
+    abd.saliva.realised = curr.abd.saliva.realised,
+    abd.saliva.potential = curr.abd.saliva.potential,
+    abd.saliva.non_transmitted = curr.abd.saliva.non_transmitted,
+    abd.stool.overlap = curr.abd.stool.overlap,
+    abd.stool.realised = curr.abd.stool.realised,
+    abd.stool.potential = curr.abd.stool.potential,
+    abd.stool.non_transmitted = curr.abd.stool.non_transmitted
+  )
+})
+
+#Get additional variables
+quant.summary$cohort <- factor(quant.summary$cohort, levels=c("FijiCOMP", "MM", "FR-CRC", "Zhang-RA", "LU-T1D"))
+quant.summary <- droplevels(quant.summary[quant.summary$group != "small_adenoma", ])
+quant.summary$group <- factor(quant.summary$group, levels=c("control", "CRC", "diabetes_type1", "rheumatoid_arthritis"))
+
+#Get mean values per subject (if multiple timepoints per subject available)
+#quant.summary <- quant.summary %>% group_by(subject) %>% summarise_all(mean, na.rm=T)
+quant.summary <- aggregate(. ~ subject + family + cohort + group + sex, data=quant.summary, mean, na.action = na.pass)
+
+#Get saliva- and stool-specific orderings of subjects
+#=> by decreasing realised transmitted abundance
+quant.summary$order.by_cohort <- order(quant.summary$cohort, quant.summary$group, 0-quant.summary$abd.saliva.realised, decreasing = F)
+quant.summary$order.s_t.saliva <- order(quant.summary$abd.saliva.realised, decreasing = T)
+quant.summary$order.s_t.stool <- order(quant.summary$abd.stool.realised, decreasing = T)
+
+#Melt for plotting
+quant.summary.melt <- melt(quant.summary, id.vars = c("subject", "family", "cohort", "group", "sex", "age", "bmi", "order.s_t.saliva", "order.s_t.stool"))
+```
+
+Prepare data on strain turnover and transmission rates.
+
+```{r}
+#Summarize relevant sample metadata per subject
+tmp.data.sample <- data.sample[, c("subject", "cohort", "group", "sex", "age", "bmi")]
+tmp.data.subject <- aggregate(cbind(age, bmi) ~ subject + cohort + group + sex, tmp.data.sample, mean, na.action=NULL)
+tmp.data.subject$sex[tmp.data.subject$sex == "female"] <- "F"
+tmp.data.subject$sex[tmp.data.subject$sex == "male"] <- "M"
+tmp.data.subject$sex <- factor(tmp.data.subject$sex, levels=c("F", "M"))
+
+#Annotate transmission rate data accordingly
+curr.data.rates <- data.rates
+curr.data.rates$group <- tmp.data.subject$group[match(as.character(curr.data.rates$subject), as.character(tmp.data.subject$subject))]
+curr.data.rates$sex <- tmp.data.subject$sex[match(as.character(curr.data.rates$subject), as.character(tmp.data.subject$subject))]
+curr.data.rates$age <- tmp.data.subject$age[match(as.character(curr.data.rates$subject), as.character(tmp.data.subject$subject))]
+curr.data.rates$bmi <- tmp.data.subject$bmi[match(as.character(curr.data.rates$subject), as.character(tmp.data.subject$subject))]
+curr.data.rates$transmitter.category <- my.data.taxa$transmitter.category[match(as.character(curr.data.rates$Tax_ID), as.character(my.data.taxa$Tax_ID))]
+
+#Summarize transmission rate data
+rates.summary.all <- aggregate(cbind(turnover, turnover.raw, turnover.transmission.raw, turnover.transmission) ~ subject + cohort + group + family + sex + age + bmi + source.site + source_sink, curr.data.rates, mean, na.action = NULL)
+rates.summary.by_cat <- aggregate(cbind(turnover, turnover.raw, turnover.transmission.raw, turnover.transmission) ~ subject + cohort + group + family + sex + age + bmi + source.site + source_sink + transmitter.category, curr.data.rates, mean, na.action = NULL)
+```
+
+What is the correlation of transmitted abundance in oral and fecal samples across subjects?
+
+```{r, fig.width=4, fig.height=4}
+my.cor <- cor.test(quant.summary$abd.saliva.realised, quant.summary$abd.stool.realised, method="spearman")
+print(my.cor)
+ggplot(quant.summary, aes(x=abd.stool.realised, y=abd.saliva.realised, colour=cohort)) +
+  geom_point(alpha=0.7) +
+  theme_minimal()
+```
+
+Preallocate results collector data.frame for stats.
+```{r}
+collect.R2 <- data.frame(
+  covariate.type = rep("microbiome", 2),
+  variable = c("transmitted abd saliva", "transmitted abd stool"),
+  covariate = rep("transmit abd in paired site", 2),
+  var.explained = rep(my.cor$estimate, 2),
+  p = rep(my.cor$p.value, 2)
+)
+```
+
+Is oral/fecal strain turnover and/or transmission rate associated to metavariables?
+
+```{r}
+lm.saliva <- lm(abd.saliva.realised ~ cohort + sex + age + bmi, data=quant.summary[quant.summary$group == "control", ])
+anova.saliva <- anova(lm.saliva, test="F")
+anova.saliva.ss <- anova.saliva$`Sum Sq`
+anova.saliva.R2 <- anova.saliva.ss/sum(anova.saliva.ss)
+print(cbind(anova.saliva,PctExp=round(anova.saliva.R2*100, digits = 3)))
+
+lm.stool <- lm(abd.stool.realised ~ cohort + sex + age + bmi, data=quant.summary[quant.summary$group == "control", ])
+anova.stool <- anova(lm.stool, test="F")
+anova.stool.ss <- anova.stool$`Sum Sq`
+anova.stool.R2 <- anova.stool.ss/sum(anova.stool.ss)
+print(cbind(anova.stool,PctExp=round(anova.stool.R2*100, digits = 3)))
+
+collect.R2 <- rbind(collect.R2, data.frame(
+  covariate.type = "subject-specific",
+  variable = c(rep("transmitted abd saliva", 4), rep("transmitted abd stool", 4)),
+  covariate = rep(c("cohort", "sex", "age", "bmi"), 2),
+  var.explained = c(anova.saliva.R2[1:4], anova.stool.R2[1:4]),
+  p = c(anova.saliva$`Pr(>F)`[1:4], anova.stool$`Pr(>F)`[1:4])
+))
+```
+
+Next, get summarised per-subject taxon abundances in OR and ST
+
+```{r}
+specI.summary <- aggregate(cbind(specI.saliva, specI.stool) ~ subject + cohort + group + Tax_ID + Scientific_Name, data=my.data.quantify_transmission, mean)
+
+#Summarise by genus
+my.data.quantify_transmission$Genus <- my.data.taxa[as.character(my.data.quantify_transmission$Tax_ID), "Genus"]
+my.data.quantify_transmission$Class <- my.data.taxa[as.character(my.data.quantify_transmission$Tax_ID), "Class"]
+specI.summary.tmp <- aggregate(cbind(specI.saliva, specI.stool) ~ subject_timepoint + subject + cohort + group + Genus + Class, data=my.data.quantify_transmission, sum)
+specI.summary.genus <- aggregate(cbind(specI.saliva, specI.stool) ~ subject + cohort + group + Genus, data=specI.summary.tmp, mean)
+specI.summary.class <- aggregate(cbind(specI.saliva, specI.stool) ~ subject + cohort + group + Class, data=specI.summary.tmp, mean)
+```
+
+For each taxon, test whether oral and/or fecal abundance correlates with oral/fecal transmitted abundance across subjects.
+
+```{r}
+specI.correlations <- ddply(specI.summary[specI.summary$Tax_ID %in% my.data.taxa$Tax_ID, ], .variables = c("Tax_ID", "Scientific_Name"), .fun = function(df) {
+  curr.subjects <- as.character(df$subject)
+  curr.transmitted_abd.OR <- quant.summary$abd.saliva.realised[match(curr.subjects, as.character(quant.summary$subject))]
+  curr.transmitted_abd.ST <- quant.summary$abd.stool.realised[match(curr.subjects, as.character(quant.summary$subject))]
+  
+  data.frame(
+    abd_saliva.transmit_saliva = cor(df$specI.saliva, curr.transmitted_abd.OR, use="complete.obs", method="spearman"),
+    abd_saliva.transmit_stool = cor(df$specI.saliva, curr.transmitted_abd.ST, use="complete.obs", method="spearman"),
+    abd_stool.transmit_saliva = cor(df$specI.stool, curr.transmitted_abd.OR, use="complete.obs", method="spearman"),
+    abd_stool.transmit_stool = cor(df$specI.stool, curr.transmitted_abd.ST, use="complete.obs", method="spearman")
+  )
+})
+specI.correlations$transmitter <- my.data.taxa[as.character(specI.correlations$Tax_ID), "transmitter"]
+specI.correlations$Z.bg_cohort.all.median <- my.data.taxa[as.character(specI.correlations$Tax_ID), "Z.bg_cohort.all.median"]
+
+#Summarise by genus
+specI.correlations.genus <- ddply(specI.summary.genus, .variables = c("Genus"), .fun = function(df) {
+  curr.subjects <- as.character(df$subject)
+  curr.transmitted_abd.OR <- quant.summary$abd.saliva.realised[match(curr.subjects, as.character(quant.summary$subject))]
+  curr.transmitted_abd.ST <- quant.summary$abd.stool.realised[match(curr.subjects, as.character(quant.summary$subject))]
+  
+  data.frame(
+    abd_saliva.transmit_saliva = cor(df$specI.saliva, curr.transmitted_abd.OR, use="complete.obs", method="spearman"),
+    abd_saliva.transmit_stool = cor(df$specI.saliva, curr.transmitted_abd.ST, use="complete.obs", method="spearman"),
+    abd_stool.transmit_saliva = cor(df$specI.stool, curr.transmitted_abd.OR, use="complete.obs", method="spearman"),
+    abd_stool.transmit_stool = cor(df$specI.stool, curr.transmitted_abd.ST, use="complete.obs", method="spearman")
+  )
+})
+
+#Summarise by class
+specI.correlations.class <- ddply(specI.summary.class, .variables = c("Class"), .fun = function(df) {
+  curr.subjects <- as.character(df$subject)
+  curr.transmitted_abd.OR <- quant.summary$abd.saliva.realised[match(curr.subjects, as.character(quant.summary$subject))]
+  curr.transmitted_abd.ST <- quant.summary$abd.stool.realised[match(curr.subjects, as.character(quant.summary$subject))]
+  
+  data.frame(
+    abd_saliva.transmit_saliva = cor(df$specI.saliva, curr.transmitted_abd.OR, use="complete.obs", method="spearman"),
+    abd_saliva.transmit_stool = cor(df$specI.saliva, curr.transmitted_abd.ST, use="complete.obs", method="spearman"),
+    abd_stool.transmit_saliva = cor(df$specI.stool, curr.transmitted_abd.OR, use="complete.obs", method="spearman"),
+    abd_stool.transmit_stool = cor(df$specI.stool, curr.transmitted_abd.ST, use="complete.obs", method="spearman")
+  )
+})
+```
+
+Store correlation data for selected relevant genera in `collect.R2`.
+
+```{r}
+keep.genera.cor <- c(
+  "Streptococcus",
+  "Granulicatella",
+  "Veillonella",
+  "Actinomyces",
+  "Rothia",
+  "Olsenella",
+  "Neisseria",
+  "Aggregatibacter",
+  "Haemophilus",
+  "Fusobacterium",
+  "Bacteroides",
+  "Prevotella",
+  "Porphyromonas",
+  "Capnocytophaga"
+)
+
+for (gen in keep.genera.cor) {
+  collect.R2 <- rbind(collect.R2, data.frame(
+    covariate.type = "microbiome",
+    variable = rep(c("transmitted abd saliva", "transmitted abd stool"), 2),
+    covariate = rep(c(paste("abd saliva", gen), paste("abd stool", gen)), each = 2),
+    var.explained = as.numeric(specI.correlations.genus[specI.correlations.genus$Genus == gen, 2:5]),
+    p = NA
+  ))
+}
+```
+
+Perform dbRDA on oral and fecal samples to test the association of community composition to transmitted/transmissibile abundance.
+
+```{r}
+source("https://raw.githubusercontent.com/defleury/Schmidt_et_al_2016_community_similarity/master/functions.community_similarity.R")
+
+#Calculate sample dissimilarities
+#-> note: all metrics are calculated as similarities, not dissimilarities
+beta.div <- list()
+beta.div[["saliva"]] <- beta.div[["stool"]] <- list()
+
+samples.saliva <- rownames(data.sample)[data.sample$material == "saliva" & data.sample$timepoint %in% c(0, 7, 600) & data.sample$subject %in% as.character(quant.summary$subject)]
+samples.stool <- rownames(data.sample)[data.sample$material == "stool" & data.sample$timepoint %in% c(0, 7, 600) & data.sample$subject %in% as.character(quant.summary$subject)]
+
+#Bray-Curtis
+beta.div[["saliva"]][["Bray_Curtis"]] <- community.similarity.par(data.specI[, samples.saliva], distance="bray_curtis", use.cores=PARAM$use.cores)
+rownames(beta.div[["saliva"]][["Bray_Curtis"]]) <- colnames(beta.div[["saliva"]][["Bray_Curtis"]]) <- as.character(data.sample[samples.saliva, "subject"])
+beta.div[["stool"]][["Bray_Curtis"]] <- community.similarity.par(data.specI[, samples.stool], distance="bray_curtis", use.cores=PARAM$use.cores)
+rownames(beta.div[["stool"]][["Bray_Curtis"]]) <- colnames(beta.div[["stool"]][["Bray_Curtis"]]) <- as.character(data.sample[samples.stool, "subject"])
+
+#Get pairwise (raw) SparCC correlations and derived "interaction matrix"
+ot.sparcc.saliva <- sparcc(data.specI[, samples.saliva], size.thresh=0, pseudocount=10^-6, nblocks=4, use.cores=PARAM$use.cores)
+ot.sparcc.S.saliva <- 0.5 * (cor.par(ot.sparcc.saliva, nblocks=100, use.cores=PARAM$use.cores) + 1)
+ot.sparcc.stool <- sparcc(data.specI[, samples.stool], size.thresh=0, pseudocount=10^-6, nblocks=4, use.cores=PARAM$use.cores)
+ot.sparcc.S.stool <- 0.5 * (cor.par(ot.sparcc.stool, nblocks=100, use.cores=PARAM$use.cores) + 1)
+
+#Unweighted TINA
+beta.div[["saliva"]][["TINA_uw"]] <- community.similarity.corr.par(data.specI[, samples.saliva], S=ot.sparcc.S.saliva, distance="jaccard.corr.uw.norm", blocksize=100, use.cores=PARAM$use.cores)
+beta.div[["saliva"]][["TINA_uw"]][beta.div[["saliva"]][["TINA_uw"]] < 0] <- 0
+diag(beta.div[["saliva"]][["TINA_uw"]]) <- 0
+rownames(beta.div[["saliva"]][["TINA_uw"]]) <- colnames(beta.div[["saliva"]][["TINA_uw"]]) <- as.character(data.sample[samples.saliva, "subject"])
+beta.div[["stool"]][["TINA_uw"]] <- community.similarity.corr.par(data.specI[, samples.stool], S=ot.sparcc.S.stool, distance="jaccard.corr.uw.norm", blocksize=100, use.cores=PARAM$use.cores)
+beta.div[["stool"]][["TINA_uw"]][beta.div[["stool"]][["TINA_uw"]] < 0] <- 0
+diag(beta.div[["stool"]][["TINA_uw"]]) <- 0
+rownames(beta.div[["stool"]][["TINA_uw"]]) <- colnames(beta.div[["stool"]][["TINA_uw"]]) <- as.character(data.sample[samples.stool, "subject"])
+```
+
+Perform dbRDA and PERMANOVA tests.
+
+```{r}
+#Perform dbRDA
+quant.summary.saliva <- quant.summary[quant.summary$subject %in% data.sample[samples.saliva, "subject"], ]
+quant.summary.stool <- quant.summary[quant.summary$subject %in% data.sample[samples.stool, "subject"], ]
+#Bray-Curtis on saliva communities
+dbRDA.bray_curtis.saliva_saliva <- dbrda(as.dist(beta.div[["saliva"]][["Bray_Curtis"]]) ~ abd.saliva.realised + Condition(cohort), data=quant.summary.saliva)
+anova(dbRDA.bray_curtis.saliva_saliva)
+RsquareAdj(dbRDA.bray_curtis.saliva_saliva)
+collect.R2 <- rbind(collect.R2, data.frame(
+  covariate.type = "microbiome",
+  variable = "transmitted abd saliva",
+  covariate = "community composition saliva",
+  var.explained = RsquareAdj(dbRDA.bray_curtis.saliva_saliva)$r.squared,
+  p = anova(dbRDA.bray_curtis.saliva_saliva)$`Pr(>F)`[1]
+))
+
+dbRDA.bray_curtis.saliva_stool <- dbrda(as.dist(beta.div[["saliva"]][["Bray_Curtis"]]) ~ abd.stool.realised + Condition(cohort), data=quant.summary.saliva)
+anova(dbRDA.bray_curtis.saliva_stool)
+RsquareAdj(dbRDA.bray_curtis.saliva_stool)
+collect.R2 <- rbind(collect.R2, data.frame(
+  covariate.type = "microbiome",
+  variable = "transmitted abd stool",
+  covariate = "community composition saliva",
+  var.explained = RsquareAdj(dbRDA.bray_curtis.saliva_stool)$r.squared,
+  p = anova(dbRDA.bray_curtis.saliva_stool)$`Pr(>F)`[1]
+))
+
+adonis.bray_curtis.saliva <- adonis2(as.dist(beta.div[["saliva"]][["Bray_Curtis"]]) ~ abd.saliva.realised + abd.stool.realised + sex, data=quant.summary.saliva, by="margin", strata=cohort)
+adonis.bray_curtis.saliva
+
+#Bray-Curtis on stool communities
+dbRDA.bray_curtis.stool_stool <- dbrda(as.dist(beta.div[["stool"]][["Bray_Curtis"]]) ~ abd.stool.realised + Condition(cohort), data=quant.summary.stool)
+anova(dbRDA.bray_curtis.stool_stool)
+RsquareAdj(dbRDA.bray_curtis.stool_stool)
+collect.R2 <- rbind(collect.R2, data.frame(
+  covariate.type = "microbiome",
+  variable = "transmitted abd stool",
+  covariate = "community composition stool",
+  var.explained = RsquareAdj(dbRDA.bray_curtis.stool_stool)$r.squared,
+  p = anova(dbRDA.bray_curtis.stool_stool)$`Pr(>F)`[1]
+))
+
+dbRDA.bray_curtis.stool_saliva <- dbrda(as.dist(beta.div[["stool"]][["Bray_Curtis"]]) ~ abd.saliva.realised + Condition(cohort), data=quant.summary.stool)
+anova(dbRDA.bray_curtis.stool_saliva)
+RsquareAdj(dbRDA.bray_curtis.stool_saliva)
+collect.R2 <- rbind(collect.R2, data.frame(
+  covariate.type = "microbiome",
+  variable = "transmitted abd saliva",
+  covariate = "community composition stool",
+  var.explained = RsquareAdj(dbRDA.bray_curtis.stool_saliva)$r.squared,
+  p = anova(dbRDA.bray_curtis.stool_saliva)$`Pr(>F)`[1]
+))
+
+adonis.bray_curtis.stool <- adonis2(as.dist(beta.div[["stool"]][["Bray_Curtis"]]) ~ sex + abd.stool.realised + abd.saliva.realised, data=quant.summary.stool, by="margin", strata=cohort)
+adonis.bray_curtis.stool
+
+#TINA on salivary communities
+adonis.TINA.saliva <- adonis2(as.dist(beta.div[["saliva"]][["TINA_uw"]]) ~ sex + abd.saliva.realised + abd.stool.realised, data=quant.summary.saliva, by="margin", strata=cohort)
+adonis.TINA.saliva
+
+#TINA on fecal communities
+adonis.TINA.stool <- adonis2(as.dist(beta.div[["stool"]][["TINA_uw"]]) ~ sex + abd.stool.realised + abd.saliva.realised, data=quant.summary.stool, by="margin", strata=cohort)
+adonis.TINA.stool
+```
+
+Next, test whether intra-individual and inter-individual oral-gut community composition are significantly different from each other.
+
+```{r}
+tmp.dt <- data.timepoint[data.timepoint$available.oral & data.timepoint$available.gut & data.timepoint$timepoint == 0 & data.timepoint$subject %in% rownames(beta.div[["saliva"]][["Bray_Curtis"]]) & data.timepoint$subject %in% rownames(beta.div[["stool"]][["Bray_Curtis"]]) & data.timepoint$group == "control", ]
+
+BC.full <- community.similarity.par(data.specI, distance="bray_curtis", use.cores=PARAM$use.cores)
+rownames(BC.full) <- colnames(BC.full) <- rownames(data.sample)
+BC.intra_indiv <- diag(BC.full[tmp.dt$sample.oral, tmp.dt$sample.gut])
+BC.inter_indiv <- c(
+  as.dist(BC.full[tmp.dt[tmp.dt$cohort == "FijiCOMP", "sample.oral"], tmp.dt[tmp.dt$cohort == "FijiCOMP", "sample.gut"]], diag=F),
+  as.dist(BC.full[tmp.dt[tmp.dt$cohort == "Zhang-RA", "sample.oral"], tmp.dt[tmp.dt$cohort == "Zhang-RA", "sample.gut"]], diag=F),
+  as.dist(BC.full[tmp.dt[tmp.dt$cohort == "LU-T1D", "sample.oral"], tmp.dt[tmp.dt$cohort == "LU-T1D", "sample.gut"]], diag=F),
+  as.dist(BC.full[tmp.dt[tmp.dt$cohort == "FR-CRC", "sample.oral"], tmp.dt[tmp.dt$cohort == "FR-CRC", "sample.gut"]], diag=F)
+)
+
+```
+
+Check for putative associations with alpha diversity.
+
+```{r}
+source("https://raw.githubusercontent.com/defleury/Toolbox_16S/master/R/function.alpha_diversity.R")
+source("https://raw.githubusercontent.com/defleury/Toolbox_16S/master/R/function.rarefaction.R")
+
+#Calculate alpha diversities
+alpha.frame.saliva <- Hill_Diversity.rarefied(data.specI[, samples.saliva], size=1000, iterations=100, q.H=c(0, 1, 2))
+alpha.frame.stool <- Hill_Diversity.rarefied(data.specI[, samples.stool], size=1000, iterations=100, q.H=c(0, 1, 2))
+
+#Add Hill evenness
+alpha.frame.saliva[, "q.1.evenness"] <- alpha.frame.saliva$q.1 / alpha.frame.saliva$q.0
+alpha.frame.saliva[, "q.2.evenness"] <- alpha.frame.saliva$q.2 / alpha.frame.saliva$q.0
+alpha.frame.stool[, "q.1.evenness"] <- alpha.frame.stool$q.1 / alpha.frame.stool$q.0
+alpha.frame.stool[, "q.2.evenness"] <- alpha.frame.stool$q.2 / alpha.frame.stool$q.0
+
+collect.cor.alpha_div <- collect.cor.alpha_div.p <- matrix(nrow=4, ncol=5, dimnames=list(c("saliva.transmit_saliva", "saliva.transmit_stool", "stool.transmit_saliva", "stool.transmit_stool"), c("q.0", "q.1", "q.2", "q.1.evenness", "q.2.evenness")))
+
+#Correlate alpha div in saliva to oral and fecal transmitted abundance
+for (q in colnames(collect.cor.alpha_div)) {
+  writeLines(q)
+  
+  #Saliva div to saliva transmitted
+  tmp <- cor.test(alpha.frame.saliva[, q], quant.summary[match(data.sample[samples.saliva, "subject"], as.character(quant.summary$subject)), "abd.saliva.realised"], method="spearman", use="complete.obs")
+  collect.cor.alpha_div["saliva.transmit_saliva", q] <- tmp$estimate
+  collect.cor.alpha_div.p["saliva.transmit_saliva", q] <- tmp$p.value
+  print(paste(tmp$estimate, tmp$p.value))
+  if (q == "q.0") {
+    collect.R2 <- rbind(collect.R2, data.frame(
+      covariate.type = "microbiome",
+      variable = "transmitted abd saliva",
+      covariate = "richness saliva",
+      var.explained = tmp$estimate,
+      p = tmp$p.value
+    ))
+  }
+  
+  #Saliva div to stool transmitted
+  tmp <- cor.test(alpha.frame.saliva[, q], quant.summary[match(data.sample[samples.saliva, "subject"], as.character(quant.summary$subject)), "abd.stool.realised"], method="spearman", use="complete.obs")
+  collect.cor.alpha_div["saliva.transmit_stool", q] <- tmp$estimate
+  collect.cor.alpha_div.p["saliva.transmit_stool", q] <- tmp$p.value
+  print(paste(tmp$estimate, tmp$p.value))
+  if (q == "q.0") {
+    collect.R2 <- rbind(collect.R2, data.frame(
+      covariate.type = "microbiome",
+      variable = "transmitted abd stool",
+      covariate = "richness saliva",
+      var.explained = tmp$estimate,
+      p = tmp$p.value
+    ))
+  }
+  
+  #Stool div to saliva transmitted
+  tmp <- cor.test(alpha.frame.stool[, q], quant.summary[match(data.sample[samples.stool, "subject"], as.character(quant.summary$subject)), "abd.saliva.realised"], method="spearman", use="complete.obs")
+  collect.cor.alpha_div["stool.transmit_saliva", q] <- tmp$estimate
+  collect.cor.alpha_div.p["stool.transmit_saliva", q] <- tmp$p.value
+  print(paste(tmp$estimate, tmp$p.value))
+  if (q == "q.0") {
+    collect.R2 <- rbind(collect.R2, data.frame(
+      covariate.type = "microbiome",
+      variable = "transmitted abd stool",
+      covariate = "richness stool",
+      var.explained = tmp$estimate,
+      p = tmp$p.value
+    ))
+  }
+  
+  #Stool div to stool transmitted
+  tmp <- cor.test(alpha.frame.stool[, q], quant.summary[match(data.sample[samples.stool, "subject"], as.character(quant.summary$subject)), "abd.stool.realised"], method="spearman", use="complete.obs")
+  collect.cor.alpha_div["stool.transmit_stool", q] <- tmp$estimate
+  collect.cor.alpha_div.p["stool.transmit_stool", q] <- tmp$p.value
+  print(paste(tmp$estimate, tmp$p.value))
+  if (q == "q.0") {
+    collect.R2 <- rbind(collect.R2, data.frame(
+      covariate.type = "microbiome",
+      variable = "transmitted abd saliva",
+      covariate = "richness stool",
+      var.explained = tmp$estimate,
+      p = tmp$p.value
+    ))
+  }
+}
+```
+
+Next, analyse differences in transmitted abundance and transmission scores between disease groups.
+
+```{r}
+#Prepare data
+data.detect.saliva_gut <- droplevels(data.detect_transmission[data.detect_transmission$coupled.sites == "saliva_gut" & data.detect_transmission$group != "small_adenoma" & data.detect_transmission$timepoint == 0, ])
+data.detect.saliva_gut$cohort <- as.factor(data.detect.saliva_gut$cohort)
+data.detect.saliva_gut$group <- as.factor(data.detect.saliva_gut$group)
+data.detect.saliva_gut <- data.detect.saliva_gut[data.detect.saliva_gut$group != "small_adenoma", ]
+data.detect.saliva_gut$sex <- data.sample[data.detect.saliva_gut$sample.oral, "sex"]
+data.detect.saliva_gut$age <- data.sample[data.detect.saliva_gut$sample.oral, "age"]
+data.detect.saliva_gut$bmi <- data.sample[data.detect.saliva_gut$sample.oral, "bmi"]
+data.detect.saliva_gut <- droplevels(data.detect.saliva_gut)
+```
+
+First, define a list of univariately over- and under-represented taxa in colorectal cancer (as per Supplement 2 in [Zeller et al, 2014](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4299606/)).
+
+```{r}
+CRC.pos_assoc <- paste0("Cluster", c(
+  "1482",
+  "1481",
+  "1479",
+  "1579",
+  "1480",
+  "1056",
+  "1580",
+  "1069",
+  "1530",
+  "1488",
+  "1506",
+  "1478",
+  "1505",
+  "1090",
+  "756",
+  "439",
+  "1720",
+  "1654",
+  "1487",
+  "1607",
+  "1600"
+))
+CRC.neg_assoc <- paste0("Cluster", c(
+  "1621",
+  "1595",
+  "1597",
+  "1627",
+  "1620",
+  "1377",
+  "1630",
+  "1631",
+  "1629",
+  "1569"
+))
+
+my.data.taxa$CRC.Zeller <- ""
+my.data.taxa$CRC.Zeller[match(CRC.pos_assoc, as.character(my.data.taxa$specI))] <- "enriched"
+my.data.taxa$CRC.Zeller[match(CRC.neg_assoc, as.character(my.data.taxa$specI))] <- "depleted"
+```
+
+```{r}
+# collect.R2 <- rbind(collect.R2, data.frame(
+#   covariate.type = "subject-specific",
+#   variable = c(rep("transmitted abd saliva", 4), rep("transmitted abd stool", 4)),
+#   covariate = rep(c("cohort", "sex", "age", "bmi"), 2),
+#   var.explained = c(anova.saliva.R2[1:4], anova.stool.R2[1:4]),
+#   p = c(anova.saliva$`Pr(>F)`[1:4], anova.stool$`Pr(>F)`[1:4])
+# ))
+
+#FR (colorectal cancer)
+#=> all taxa
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "FR-CRC", ]
+mean(curr.data.detect[curr.data.detect$group == "CRC", "S.z.bg_cohort.all"]) / mean(curr.data.detect[curr.data.detect$group == "control", "S.z.bg_cohort.all"])
+wilcox.test(S.z.bg_cohort.all ~ group, data=curr.data.detect)
+lm.crc <- lm(S.z.bg_cohort.all ~ Taxon + sex + bmi + age + group, data=curr.data.detect)
+anova.crc <- anova(lm.crc, test="F")
+anova.crc.ss <- anova.crc$`Sum Sq`
+anova.crc.R2 <- anova.crc.ss/sum(anova.crc.ss)
+print(cbind(anova.crc,PctExp=round(anova.crc.R2*100, digits = 3)))
+#=> transmitting taxa
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "FR-CRC" & data.detect.saliva_gut$Taxon %in% as.character(my.data.taxa$Scientific_Name[my.data.taxa$transmitter.category %in% c("transmitter", "occasional transmitter")]), ]
+mean(curr.data.detect[curr.data.detect$group == "CRC", "S.z.bg_cohort.all"]) / mean(curr.data.detect[curr.data.detect$group == "control", "S.z.bg_cohort.all"])
+wilcox.test(S.z.bg_cohort.all ~ group, data=curr.data.detect)
+lm.crc <- lm(S.z.bg_cohort.all ~ Taxon + sex + bmi + age + group, data=curr.data.detect)
+anova.crc <- anova(lm.crc, test="F")
+anova.crc.ss <- anova.crc$`Sum Sq`
+anova.crc.R2 <- anova.crc.ss/sum(anova.crc.ss)
+print(cbind(anova.crc,PctExp=round(anova.crc.R2*100, digits = 3)))
+#=> CRC-enriched taxa
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "FR-CRC" & data.detect.saliva_gut$Taxon %in% my.data.taxa$Scientific_Name[my.data.taxa$CRC.Zeller == "enriched"], ]
+mean(curr.data.detect[curr.data.detect$group == "CRC", "S.z.bg_cohort.all"]) / mean(curr.data.detect[curr.data.detect$group == "control", "S.z.bg_cohort.all"])
+wilcox.test(S.z.bg_cohort.all ~ group, data=curr.data.detect)
+lm.crc <- lm(S.z.bg_cohort.all ~ Taxon + sex + bmi + age + group, data=curr.data.detect)
+anova.crc <- anova(lm.crc, test="F")
+anova.crc.ss <- anova.crc$`Sum Sq`
+anova.crc.R2 <- anova.crc.ss/sum(anova.crc.ss)
+print(cbind(anova.crc,PctExp=round(anova.crc.R2*100, digits = 3)))
+#=> CRC-depleted taxa
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "FR-CRC" & data.detect.saliva_gut$Taxon %in% my.data.taxa$Scientific_Name[my.data.taxa$CRC.Zeller == "depleted"], ]
+mean(curr.data.detect[curr.data.detect$group == "CRC", "S.z.bg_cohort.all"]) / mean(curr.data.detect[curr.data.detect$group == "control", "S.z.bg_cohort.all"])
+wilcox.test(S.z.bg_cohort.all ~ group, data=curr.data.detect)
+lm.crc <- lm(S.z.bg_cohort.all ~ Taxon + sex + bmi + age + group, data=curr.data.detect)
+anova.crc <- anova(lm.crc, test="F")
+anova.crc.ss <- anova.crc$`Sum Sq`
+anova.crc.R2 <- anova.crc.ss/sum(anova.crc.ss)
+print(cbind(anova.crc,PctExp=round(anova.crc.R2*100, digits = 3)))
+```
+
+
+```{r}
+#=> transmitted abundance in saliva
+curr.quant.summary <- quant.summary[quant.summary$cohort == "FR-CRC", ]
+lm.saliva <- lm(abd.saliva.realised ~ group + sex + age + bmi, data=curr.quant.summary)
+anova.saliva <- anova(lm.saliva, test="F")
+anova.saliva.ss <- anova.saliva$`Sum Sq`
+anova.saliva.R2 <- anova.saliva.ss/sum(anova.saliva.ss)
+print(cbind(anova.saliva,PctExp=round(anova.saliva.R2*100, digits = 3)))
+ggplot(curr.quant.summary, aes(x=group, y=abd.saliva.realised)) + geom_boxplot(outlier.colour = NA) + geom_jitter() + theme_minimal()
+#=> transmitted abundance in stool
+lm.stool <- lm(abd.stool.realised ~ group + sex + age + bmi, data=curr.quant.summary)
+anova.stool <- anova(lm.stool, test="F")
+anova.stool.ss <- anova.stool$`Sum Sq`
+anova.stool.R2 <- anova.stool.ss/sum(anova.stool.ss)
+print(cbind(anova.stool,PctExp=round(anova.stool.R2*100, digits = 3)))
+ggplot(curr.quant.summary, aes(x=group, y=abd.stool.realised)) + geom_boxplot(outlier.colour = NA) + geom_jitter() + theme_minimal()
+
+#=> transmitted abundance of CRC-associated taxa
+quant.summary.CRC <- ddply(my.data.quantify_transmission[my.data.quantify_transmission$Scientific_Name %in% my.data.taxa$Scientific_Name[my.data.taxa$CRC.Zeller == "enriched"] & my.data.quantify_transmission$cohort == "FR-CRC" & my.data.quantify_transmission$group != "small_adenoma", ] , "subject_timepoint", function(df) {
+  #Get current subject_timepoint
+  s_t <- as.character(df$subject_timepoint)[1]
+  
+  #Get current detect_transmission data
+  curr.detect <- my.data.detect_transmission[my.data.detect_transmission$subject_timepoint == s_t, ]
+  curr.detect <- curr.detect[match(as.character(df$Tax_ID), curr.detect$Tax_ID), ]
+  
+  #Get "realised" transmitters: global transmitters w/ paired obs >0 in ST and/or locally significant transmitters
+  curr.transmit.realised <- 
+    df$specI.saliva > 0 &
+    df$specI.stool > 0 &
+    ((as.character(df$Scientific_Name) %in% transmitting_taxa) | (!is.na(curr.detect$S.z.bg_cohort.all.p.adj) & curr.detect$S.z.bg_cohort.all.p.adj < 0.05))
+  
+  #Get total saliva and stool observed taxa count
+  curr.n_saliva <- sum(df$specI.saliva > 0, na.rm=T)
+  curr.n_stool <- sum(df$specI.stool > 0, na.rm=T)
+  
+  #Sum salivary and fecal realised transmitted abundance
+  curr.abd.saliva.realised <- sum(df$transmitted_abd.in_saliva[curr.transmit.realised], na.rm=T)
+  curr.abd.stool.realised <- sum(df$transmitted_abd.in_stool[curr.transmit.realised], na.rm=T)
+  
+  data.frame(
+    subject = as.character(df$subject)[1],
+    cohort = as.character(df$cohort)[1],
+    group = as.character(df$group)[1],
+    sex = data.sample[data.sample$subject_timepoint == s_t, "sex"][1],
+    age = data.sample[data.sample$subject_timepoint == s_t, "age"][1],
+    bmi = data.sample[data.sample$subject_timepoint == s_t, "bmi"][1],
+    abd.saliva.realised = curr.abd.saliva.realised,
+    abd.stool.realised = curr.abd.stool.realised
+  )
+})
+lm.saliva <- lm(abd.saliva.realised ~ group + sex + age + bmi, data=quant.summary.CRC)
+anova.saliva <- anova(lm.saliva, test="F")
+anova.saliva.ss <- anova.saliva$`Sum Sq`
+anova.saliva.R2 <- anova.saliva.ss/sum(anova.saliva.ss)
+print(cbind(anova.saliva,PctExp=round(anova.saliva.R2*100, digits = 3)))
+ggplot(quant.summary.CRC, aes(x=group, y=abd.saliva.realised)) + geom_boxplot(outlier.colour = NA) + geom_jitter() + theme_minimal()
+#=> transmitted abundance in stool
+lm.stool <- lm(abd.stool.realised ~ group + sex + age + bmi, data=quant.summary.CRC)
+anova.stool <- anova(lm.stool, test="F")
+anova.stool.ss <- anova.stool$`Sum Sq`
+anova.stool.R2 <- anova.stool.ss/sum(anova.stool.ss)
+print(cbind(anova.stool,PctExp=round(anova.stool.R2*100, digits = 3)))
+ggplot(quant.summary.CRC, aes(x=group, y=abd.stool.realised)) + geom_boxplot(outlier.colour = NA) + geom_jitter() + scale_y_sqrt() + theme_minimal()
+```
+
+Plot transmission scores in cases vs controls for CRC-enrichted taxa.
+
+```{r}
+library(effsize)
+
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "FR-CRC" & data.detect.saliva_gut$Taxon %in% my.data.taxa$Scientific_Name[my.data.taxa$CRC.Zeller == "enriched"], ]
+
+#Test differences in transmission scores per each individual taxon
+res.CRC_enriched <- ddply(droplevels(curr.data.detect), "Taxon", function(df) {
+  data.frame(
+    mean.diff = mean(outer(df$S.z.bg_cohort.all[df$group == "CRC"], df$S.z.bg_cohort.all[df$group == "control"], "-"), na.rm=T),
+    cohen.d = cohen.d(df$S.z.bg_cohort.all, df$group, na.rm=T)$estimate,
+    p_raw = wilcox.test(S.z.bg_cohort.all ~ group, data=df)$p.value
+  )
+})
+res.CRC_enriched$p <- p.adjust(res.CRC_enriched$p_raw, method="BH")
+
+p.CRC_enriched <- ggplot(droplevels(curr.data.detect), aes(x=Taxon, y=S.z.bg_cohort.all, fill=group, colour=group)) +
+  geom_boxplot(outlier.colour = NA, colour="black", alpha=0.7) +
+  #geom_violin(scale="width", colour=NA, alpha=0.7) +
+  geom_point(position=position_jitterdodge(jitter.width = 0.2), size=1) +
+  scale_fill_manual(values=c("#a6cee3", "#e31a1c")) +
+  scale_colour_manual(values=c("#a6cee3", "#e31a1c")) +
+  ylab("Transission Score") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_blank(),
+    text = element_text(family="Helvetica"),
+    axis.text = element_text(size=6)
+  ) +
+  NULL
+p.CRC_enriched
+
+ggsave(p.CRC_enriched, width=20, height=16, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_3.disease.CRC.scores_per_taxon.pdf"), useDingbats=F, dpi=1200)
+```
+
+...and repeat for transmitted abundances
+
+```{r}
+#Re-analyse per individual CRC-associated taxon
+res.CRC.per_taxon <- ddply(my.data.quantify_transmission[my.data.quantify_transmission$Scientific_Name %in% my.data.taxa$Scientific_Name[my.data.taxa$CRC.Zeller == "enriched"] & my.data.quantify_transmission$cohort == "FR-CRC" & my.data.quantify_transmission$group != "small_adenoma", ] , c("Scientific_Name"), function(df) {
+  data.frame(
+    abd.saliva.mean_ratio = mean(df$transmitted_abd.in_saliva[df$group == "CRC"], na.rm=T) / mean(df$transmitted_abd.in_saliva[df$group == "control"], na.rm=T),
+    abd.saliva.cohen = cohen.d(transmitted_abd.in_saliva ~ group, data=df, na.rm=T)$estimate,
+    abd.saliva.p_raw = wilcox.test(transmitted_abd.in_saliva ~ group, data=df)$p.value,
+    abd.stool.mean_ratio = mean(df$transmitted_abd.in_stool[df$group == "CRC"], na.rm=T) / mean(df$transmitted_abd.in_stool[df$group == "control"], na.rm=T),
+    abd.stool.cohen = cohen.d(transmitted_abd.in_stool ~ group, data=df, na.rm=T)$estimate,
+    abd.stool.p_raw = wilcox.test(transmitted_abd.in_stool ~ group, data=df)$p.value
+  )
+})
+```
+
+Next, process Zhang rheumatoid arthritis cohort.
+First, detect univariate associations of species abd to case-control status.
+
+```{r}
+#Detect univariate associations of species to case-control status
+specI.Zhang.ST <- data.specI.rel[as.character(my.data.taxa$Tax_ID), data.sample$cohort == "Zhang-RA" & data.sample$material == "stool" & data.sample$timepoint == 0]
+specI.Zhang.SA <- data.specI.rel[as.character(my.data.taxa$Tax_ID), data.sample$cohort == "Zhang-RA" & data.sample$material == "saliva" & data.sample$timepoint == 0]
+
+fun.detect_univariate.RA <- function(vec) {
+  tmp.group <- droplevels(data.sample[names(vec), "group"])
+  data.frame(
+    mean_ratio = log2(mean(vec[tmp.group == "rheumatoid_arthritis"], na.rm=T) / mean(vec[tmp.group == "control"], na.rm=T)),
+    cohen.d = cohen.d(vec, tmp.group, na.rm=T)$estimate,
+    p_raw = wilcox.test(vec[tmp.group == "rheumatoid_arthritis"], vec[tmp.group == "control"])$p.value
+  )
+}
+test.RA.ST <- adply(specI.Zhang.ST, 1, fun.detect_univariate.RA)
+test.RA.SA <- adply(specI.Zhang.SA, 1, fun.detect_univariate.RA)
+test.RA.ST$Taxon <- test.RA.SA$Taxon <- my.data.taxa$Scientific_Name
+test.RA.ST$p <- p.adjust(test.RA.ST$p_raw, method="BH")
+test.RA.SA$p <- p.adjust(test.RA.SA$p_raw, method="BH")
+
+test.RA.SA.sig <- na.omit(test.RA.SA[test.RA.SA$p < 0.05, ])
+test.RA.SA.sig <- test.RA.SA.sig[order(test.RA.SA.sig$mean_ratio, decreasing = T), ]
+
+my.data.taxa$RA.SA <- ""
+my.data.taxa[as.character(test.RA.SA.sig$X1)[test.RA.SA.sig$mean_ratio > 0], "RA.SA"] <- "enriched"
+my.data.taxa[as.character(test.RA.SA.sig$X1)[test.RA.SA.sig$mean_ratio < 0], "RA.SA"] <- "depleted"
+```
+
+```{r}
+#Zhang-RA (rheumatoid arthritis)
+#=> all taxa
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "Zhang-RA", ]
+curr.data.detect <- aggregate(S.z.bg_cohort.all ~ subject + Taxon + group + sex + age + bmi, data=curr.data.detect, mean)
+mean(curr.data.detect[curr.data.detect$group == "rheumatoid_arthritis", "S.z.bg_cohort.all"]) / mean(curr.data.detect[curr.data.detect$group == "control", "S.z.bg_cohort.all"])
+wilcox.test(S.z.bg_cohort.all ~ group, data=curr.data.detect)
+lm.ra <- lm(S.z.bg_cohort.all ~ Taxon + sex + bmi + age + group, data=curr.data.detect)
+anova.ra <- anova(lm.ra, test="F")
+anova.ra.ss <- anova.ra$`Sum Sq`
+anova.ra.R2 <- anova.ra.ss/sum(anova.ra.ss)
+print(cbind(anova.ra,PctExp=round(anova.ra.R2*100, digits = 3)))
+#=> transmitting taxa
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "Zhang-RA" & data.detect.saliva_gut$Taxon %in% as.character(my.data.taxa$Scientific_Name[my.data.taxa$transmitter.category %in% c("transmitter", "occasional transmitter")]), ]
+curr.data.detect <- aggregate(S.z.bg_cohort.all ~ subject + Taxon + group + sex + age + bmi, data=curr.data.detect, mean)
+mean(curr.data.detect[curr.data.detect$group == "rheumatoid_arthritis", "S.z.bg_cohort.all"], na.rm=T) / mean(curr.data.detect[curr.data.detect$group == "control", "S.z.bg_cohort.all"], na.rm=T)
+wilcox.test(S.z.bg_cohort.all ~ group, data=curr.data.detect)
+lm.ra <- lm(S.z.bg_cohort.all ~ Taxon + sex + bmi + age + group, data=curr.data.detect)
+anova.ra <- anova(lm.ra, test="F")
+anova.ra.ss <- anova.ra$`Sum Sq`
+anova.ra.R2 <- anova.ra.ss/sum(anova.ra.ss)
+print(cbind(anova.ra,PctExp=round(anova.ra.R2*100, digits = 3)))
+#=> RA-enriched taxa (in saliva)
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "Zhang-RA" & data.detect.saliva_gut$Taxon %in% as.character(my.data.taxa$Scientific_Name[my.data.taxa$RA.SA == "enriched"]), ]
+curr.data.detect <- aggregate(S.z.bg_cohort.all ~ subject + Taxon + group + sex + age + bmi, data=curr.data.detect, mean)
+mean(curr.data.detect[curr.data.detect$group == "rheumatoid_arthritis", "S.z.bg_cohort.all"], na.rm=T) / mean(curr.data.detect[curr.data.detect$group == "control", "S.z.bg_cohort.all"], na.rm=T)
+wilcox.test(S.z.bg_cohort.all ~ group, data=curr.data.detect)
+lm.ra <- lm(S.z.bg_cohort.all ~ Taxon + sex + bmi + age + group, data=curr.data.detect)
+anova.ra <- anova(lm.ra, test="F")
+anova.ra.ss <- anova.ra$`Sum Sq`
+anova.ra.R2 <- anova.ra.ss/sum(anova.ra.ss)
+print(cbind(anova.ra,PctExp=round(anova.ra.R2*100, digits = 3)))
+#=> RA-depleted taxa (in saliva)
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "Zhang-RA" & data.detect.saliva_gut$Taxon %in% as.character(my.data.taxa$Scientific_Name[my.data.taxa$RA.SA == "depleted"]), ]
+curr.data.detect <- aggregate(S.z.bg_cohort.all ~ subject + Taxon + group + sex + age + bmi, data=curr.data.detect, mean)
+mean(curr.data.detect[curr.data.detect$group == "rheumatoid_arthritis", "S.z.bg_cohort.all"], na.rm=T) / mean(curr.data.detect[curr.data.detect$group == "control", "S.z.bg_cohort.all"], na.rm=T)
+wilcox.test(S.z.bg_cohort.all ~ group, data=curr.data.detect)
+lm.ra <- lm(S.z.bg_cohort.all ~ Taxon + sex + bmi + age + group, data=curr.data.detect)
+anova.ra <- anova(lm.ra, test="F")
+anova.ra.ss <- anova.ra$`Sum Sq`
+anova.ra.R2 <- anova.ra.ss/sum(anova.ra.ss)
+print(cbind(anova.ra,PctExp=round(anova.ra.R2*100, digits = 3)))
+```
+
+```{r}
+#=> transmitted abundance in saliva
+curr.quant.summary <- quant.summary[quant.summary$cohort == "Zhang-RA" & quant.summary$age > 21, ]
+lm.saliva <- lm(abd.saliva.realised ~ sex + age + bmi + group, data=curr.quant.summary)
+anova.saliva <- anova(lm.saliva, test="F")
+anova.saliva.ss <- anova.saliva$`Sum Sq`
+anova.saliva.R2 <- anova.saliva.ss/sum(anova.saliva.ss)
+print(cbind(anova.saliva,PctExp=round(anova.saliva.R2*100, digits = 3)))
+ggplot(curr.quant.summary, aes(x=group, y=abd.saliva.realised)) + geom_boxplot(outlier.colour = NA) + geom_jitter() + theme_minimal()
+#=> transmitted abundance in stool
+lm.stool <- lm(abd.stool.realised ~ group + sex + age + bmi, data=curr.quant.summary)
+anova.stool <- anova(lm.stool, test="F")
+anova.stool.ss <- anova.stool$`Sum Sq`
+anova.stool.R2 <- anova.stool.ss/sum(anova.stool.ss)
+print(cbind(anova.stool,PctExp=round(anova.stool.R2*100, digits = 3)))
+ggplot(curr.quant.summary, aes(x=group, y=abd.stool.realised)) + geom_boxplot(outlier.colour = NA) + geom_jitter() + scale_y_sqrt() + theme_minimal()
+```
+
+
+```{r}
+#LU-T1D (restricted to adults, age > 21)
+#=> all taxa
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "LU-T1D" & data.detect.saliva_gut$age > 21, ]
+curr.data.detect <- aggregate(S.z.bg_cohort.all ~ subject + family + Taxon + group + sex + age + bmi, data=curr.data.detect, mean)
+mean(curr.data.detect[curr.data.detect$group == "diabetes_type1", "S.z.bg_cohort.all"]) / mean(curr.data.detect[curr.data.detect$group == "control", "S.z.bg_cohort.all"])
+wilcox.test(S.z.bg_cohort.all ~ group, data=curr.data.detect)
+lm.t1d <- lm(S.z.bg_cohort.all ~ Taxon + family + sex + bmi + age + group, data=curr.data.detect)
+anova.t1d <- anova(lm.t1d, test="F")
+anova.t1d.ss <- anova.t1d$`Sum Sq`
+anova.t1d.R2 <- anova.t1d.ss/sum(anova.t1d.ss)
+print(cbind(anova.t1d,PctExp=round(anova.t1d.R2*100, digits = 3)))
+#=> transmitting taxa
+curr.data.detect <- data.detect.saliva_gut[data.detect.saliva_gut$cohort == "LU-T1D" & data.detect.saliva_gut$age > 21 & data.detect.saliva_gut$Taxon %in% as.character(my.data.taxa$Scientific_Name[my.data.taxa$transmitter.category %in% c("transmitter", "occasional transmitter")]), ]
+curr.data.detect <- aggregate(S.z.bg_cohort.all ~ subject + family + Taxon + group + sex + age + bmi, data=curr.data.detect, mean)
+mean(curr.data.detect[curr.data.detect$group == "diabetes_type1", "S.z.bg_cohort.all"]) / mean(curr.data.detect[curr.data.detect$group == "control", "S.z.bg_cohort.all"])
+wilcox.test(S.z.bg_cohort.all ~ group, data=curr.data.detect)
+lm.t1d <- lm(S.z.bg_cohort.all ~ Taxon + family + sex + bmi + age + group, data=curr.data.detect)
+anova.t1d <- anova(lm.t1d, test="F")
+anova.t1d.ss <- anova.t1d$`Sum Sq`
+anova.t1d.R2 <- anova.t1d.ss/sum(anova.t1d.ss)
+print(cbind(anova.t1d,PctExp=round(anova.t1d.R2*100, digits = 3)))
+```
+
+```{r}
+#=> transmitted abundance in saliva
+curr.quant.summary <- quant.summary[quant.summary$cohort == "LU-T1D" & quant.summary$age > 21, ]
+lm.saliva <- lm(abd.saliva.realised ~ family + sex + age + bmi + group, data=curr.quant.summary)
+anova.saliva <- anova(lm.saliva, test="F")
+anova.saliva.ss <- anova.saliva$`Sum Sq`
+anova.saliva.R2 <- anova.saliva.ss/sum(anova.saliva.ss)
+print(cbind(anova.saliva,PctExp=round(anova.saliva.R2*100, digits = 3)))
+ggplot(curr.quant.summary, aes(x=group, y=abd.saliva.realised)) + geom_boxplot(outlier.colour = NA) + geom_jitter() + theme_minimal()
+#=> transmitted abundance in stool
+lm.stool <- lm(abd.stool.realised ~ group + sex + age + bmi, data=curr.quant.summary)
+anova.stool <- anova(lm.stool, test="F")
+anova.stool.ss <- anova.stool$`Sum Sq`
+anova.stool.R2 <- anova.stool.ss/sum(anova.stool.ss)
+print(cbind(anova.stool,PctExp=round(anova.stool.R2*100, digits = 3)))
+ggplot(curr.quant.summary, aes(x=group, y=abd.stool.realised)) + geom_boxplot(outlier.colour = NA) + geom_jitter() + theme_minimal()
+```
+
+Wrap these analyses together to generate a common data.frame for plotting:
+* CRC transmission scores btw groups for all taxa
+* CRC transmission scores btw groups for CRC-associated taxa
+* RA transmission scores btw groups for all taxa
+* RA transmission scores btw groups for transmitting taxa
+* RA transmission scores btw groups for taxa depleted in RA saliva
+
+To plot transmission scores, re-scale all scores per taxon by mean and sd of controls.
+
+```{r}
+dummy.frame <- data.frame(matrix(nrow=0, ncol=3, dimnames = list(NULL, c("cohort", "group", "score"))))
+fun.z_transform.disease <- function(df, cohort, case_cat) {
+  if (sum(df$group == case_cat) < 5 | sum(df$group == "control") < 5) {return(dummy.frame)}
+  tmp.Z <- (df$S.z.bg_cohort.all[df$cohort == cohort & df$group == case_cat] - mean(df$S.z.bg_cohort.all[df$cohort == cohort & df$group == "control"], na.rm=T)) / sd(df$S.z.bg_cohort.all[df$cohort == cohort & df$group == "control"], na.rm=T)
+  data.frame(
+    cohort=cohort,
+    group=case_cat,
+    score=tmp.Z
+  )
+}
+d.disease.scores <- ddply(droplevels(data.detect.saliva_gut[data.detect.saliva_gut$cohort %in% c("FR-CRC", "Zhang-RA"), ]), .var = "Taxon", .inform = T, .fun=function(df) {
+  if (nrow(df) == 0) {return()}
+  rbind(
+    fun.z_transform.disease(df, "FR-CRC", "CRC"),
+    fun.z_transform.disease(df, "Zhang-RA", "rheumatoid_arthritis")
+  )
+})
+d.disease.scores$CRC.Zeller <- my.data.taxa[match(as.character(d.disease.scores$Taxon), as.character(my.data.taxa$Scientific_Name)), "CRC.Zeller"]
+d.disease.scores$RA.SA <- my.data.taxa[match(as.character(d.disease.scores$Taxon), as.character(my.data.taxa$Scientific_Name)), "RA.SA"]
+d.disease.scores$transmitter.category <- my.data.taxa[match(as.character(d.disease.scores$Taxon), as.character(my.data.taxa$Scientific_Name)), "transmitter.category"]
+
+#Concatenate data.frame w/ sub-selected data classes
+res.disease.scores <- rbind(
+  cbind(d.disease.scores, data.frame(category = "all taxa")),
+  cbind(d.disease.scores[d.disease.scores$transmitter.category %in% c("transmitter", "occasional transmitter"), ], data.frame(category="transmitting taxa")),
+  cbind(d.disease.scores[d.disease.scores$CRC.Zeller == "enriched" & d.disease.scores$cohort == "FR-CRC", ], data.frame(category="CRC enriched")),
+  cbind(d.disease.scores[d.disease.scores$RA.SA == "depleted" & d.disease.scores$cohort == "Zhang-RA", ], data.frame(category="RA depleted"))
+)
+res.disease.scores$cohort <- factor(res.disease.scores$cohort, levels=c("Zhang-RA", "FR-CRC"))
+
+#Plot
+p.disease_scores <- ggplot(res.disease.scores, aes(x=interaction(cohort, category), y=score, fill=cohort, group=interaction(cohort, category))) +
+  geom_violin(alpha=0.8, colour=NA, draw_quantiles = 0.5) +
+  #geom_point(data=aggregate(score ~ cohort + category, data=res.disease.scores, median), size=2, colour="grey") +
+  geom_point(data=aggregate(score ~ cohort + category, data=res.disease.scores, mean), size=2, colour="white") +
+  scale_fill_manual(values=c("#41ab5d", "#ae017e")) +
+  scale_x_discrete(limits=rev(c("FR-CRC.all taxa", "FR-CRC.transmitting taxa", "FR-CRC.CRC enriched", "Zhang-RA.all taxa", "Zhang-RA.transmitting taxa", "Zhang-RA.RA depleted"))) +
+  scale_y_continuous(breaks=seq(-3, 5,by=1), limits = c(-3, 5)) +
+  geom_hline(yintercept = 0, size=0.5, colour="grey") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  ) +
+  NULL
+p.disease_scores
+```
+
+
+```{r}
+#Repeat, but for Cohen's d effect size estimates
+dummy.frame <- data.frame(matrix(nrow=0, ncol=3, dimnames = list(NULL, c("cohort", "group", "cohen.d"))))
+fun.cohen_d.disease <- function(df, cohort, case_cat) {
+  if (sum(df$group == case_cat) < 5 | sum(df$group == "control") < 5) {return(dummy.frame)}
+  data.frame(
+    cohort=cohort,
+    group=case_cat,
+    cohen.d=cohen.d(df$S.z.bg_cohort.all[df$cohort == cohort & df$group == case_cat], df$S.z.bg_cohort.all[df$cohort == cohort & df$group == "control"], na.rm=T)$estimate
+  )
+}
+d.disease.scores <- ddply(droplevels(data.detect.saliva_gut[data.detect.saliva_gut$cohort %in% c("FR-CRC", "Zhang-RA"), ]), .var = "Taxon", .inform = T, .fun=function(df) {
+  if (nrow(df) == 0) {return()}
+  rbind(
+    fun.cohen_d.disease(df, "FR-CRC", "CRC"),
+    fun.cohen_d.disease(df, "Zhang-RA", "rheumatoid_arthritis")
+  )
+})
+d.disease.scores$CRC.Zeller <- my.data.taxa[match(as.character(d.disease.scores$Taxon), as.character(my.data.taxa$Scientific_Name)), "CRC.Zeller"]
+d.disease.scores$RA.SA <- my.data.taxa[match(as.character(d.disease.scores$Taxon), as.character(my.data.taxa$Scientific_Name)), "RA.SA"]
+d.disease.scores$transmitter.category <- my.data.taxa[match(as.character(d.disease.scores$Taxon), as.character(my.data.taxa$Scientific_Name)), "transmitter.category"]
+
+#Export data
+write.table(d.disease.scores[d.disease.scores$cohort == "FR-CRC", ], file=paste0(PARAM$folder.results, "Figure_3.disease_cohen_d.CRC.tsv"), sep="\t", col.names = NA)
+write.table(d.disease.scores[d.disease.scores$cohort == "Zhang-RA", ], file=paste0(PARAM$folder.results, "Figure_3.disease_cohen_d.RA.tsv"), sep="\t", col.names = NA)
+
+#Concatenate data.frame w/ sub-selected data classes
+res.disease.scores <- rbind(
+  cbind(d.disease.scores, data.frame(category = "all taxa")),
+  cbind(d.disease.scores[d.disease.scores$transmitter.category %in% c("transmitter", "occasional transmitter"), ], data.frame(category="transmitting taxa")),
+  cbind(d.disease.scores[d.disease.scores$CRC.Zeller == "enriched" & d.disease.scores$cohort == "FR-CRC", ], data.frame(category="CRC enriched")),
+  cbind(d.disease.scores[d.disease.scores$RA.SA == "depleted" & d.disease.scores$cohort == "Zhang-RA", ], data.frame(category="RA depleted"))
+)
+res.disease.scores$cohort <- factor(res.disease.scores$cohort, levels=c("Zhang-RA", "FR-CRC"))
+
+p.disease_cohen_d <- ggplot(res.disease.scores, aes(x=interaction(cohort, category), y=cohen.d, colour=cohort, group=interaction(cohort, category))) +
+  #geom_violin(alpha=0.8, colour=NA, draw_quantiles = 0.5) +
+  #geom_point(data=aggregate(score ~ cohort + category, data=res.disease.scores, median), size=2, colour="grey") +
+  geom_point(size=0.5, position=position_jitterdodge(jitter.width = 0.6), alpha=0.6) +
+  geom_point(data=aggregate(cohen.d ~ cohort + category, data=res.disease.scores, mean), size=2, colour="grey", alpha=1) +
+  scale_colour_manual(values=c("#41ab5d", "#ae017e")) +
+  scale_x_discrete(limits=rev(c("FR-CRC.all taxa", "FR-CRC.transmitting taxa", "FR-CRC.CRC enriched", "Zhang-RA.all taxa", "Zhang-RA.transmitting taxa", "Zhang-RA.RA depleted"))) +
+  #scale_y_continuous(breaks=seq(-3, 5,by=1), limits = c(-3, 5)) +
+  geom_hline(yintercept = c(-0.8, -0.5, -0.2, 0, 0.2, 0.5, 0.8, 1.2), size=0.5, colour="grey") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  ) +
+  NULL
+p.disease_cohen_d
+
+
+ggsave(p.disease_scores, width=7, height=9, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_2.disease_scores.pdf"), useDingbats=F, dpi=1200)
+ggsave(p.disease_cohen_d, width=7, height=9, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_2.disease_cohen_d.pdf"), useDingbats=F, dpi=1200)
+
+#Stitch together horizontally
+p.combined <- plot_grid(
+  p.disease_scores,
+  p.disease_cohen_d,
+  ncol=2,
+  nrow=1,
+  align="h",
+  rel_widths =  c(10, 7)
+)
+#Save
+p.combined.gg <- ggdraw(p.combined)
+p.combined.gg
+ggsave(p.combined.gg, width=12, height=8, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_3.disease_combined.pdf"), useDingbats=F, dpi=1200)
+```
+
+
+Next, generate plots on number of potential and realised transmitters per in oral and fecal samples, ranked by the corresponding transmitted total abundance.
+
+```{r, fig.width=6, fig.height=2}
+p.n_species.saliva <- ggplot(quant.summary, aes(x=subject, y=n.potential)) +
+  #Connect realised and potential transmitters by vertical line
+  geom_line(data=quant.summary.melt[quant.summary.melt$variable %in% c("n.realised", "n.potential"), ], aes(y=value), size=0.1, colour="#bdbdbd") +
+  #Add points on transmitted species
+  geom_point(aes(y=n.realised), size=0.2, colour=PARAM$colour.transmitter, alpha=0.6) +
+  #Add points on potentially transmissible species
+  geom_point(aes(y=n.potential), size=0.2, colour=PARAM$colour.occ_transmitter, alpha=0.6) +
+  geom_hline(yintercept = median(quant.summary$n.realised), colour="#00441b", size=0.3) +
+  geom_hline(yintercept = median(quant.summary$n.potential), colour="#00441b", size=0.3, alpha=0.6) +
+  #Scale x axis properly
+  scale_x_discrete(limits = quant.summary$subject[quant.summary$order.s_t.saliva]) +
+  #Set theme
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(family="Helvetica", size=5),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank(),
+    plot.margin = unit(c(0, 0, 0, 0), "cm")
+  )
+p.n_species.saliva
+
+p.n_species.stool <- ggplot(quant.summary, aes(x=subject, y=n.potential)) +
+  #Connect realised and potential transmitters by vertical line
+  geom_line(data=quant.summary.melt[quant.summary.melt$variable %in% c("n.realised", "n.potential.stool"), ], aes(y=value), size=0.1, colour="#bdbdbd") +
+  #Add points on transmitted species
+  geom_point(aes(y=n.realised), size=0.2, colour=PARAM$colour.transmitter, alpha=0.6) +
+  #Add points on potentially transmissible species
+  geom_point(aes(y=n.potential.stool), size=0.2, colour=PARAM$colour.occ_transmitter, alpha=0.6) +
+  geom_hline(yintercept = median(quant.summary$n.realised), colour="#00441b", size=0.3) +
+  geom_hline(yintercept = median(quant.summary$n.potential.stool), colour="#00441b", size=0.3, alpha=0.6) +
+  #Scale x axis properly
+  scale_x_discrete(limits = quant.summary$subject[quant.summary$order.s_t.stool]) +
+  #Set theme
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(family="Helvetica", size=5),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank(),
+    plot.margin = unit(c(0, 0, 0, 0), "cm")
+  )
+p.n_species.stool
+```
+
+Plot summary histograms of oral and fecal potential and realised transmitted abundance,
+
+```{r, fig.width=6, fig.height=3}
+#Prepare data for plotting
+plot.df <- quant.summary
+plot.df$abd.saliva.potential <- plot.df$abd.saliva.potential + plot.df$abd.saliva.realised
+plot.df$abd.stool.potential <- plot.df$abd.stool.potential + plot.df$abd.stool.realised
+plot.df <- melt(plot.df, id.vars = c("subject", "cohort", "group"), measure.vars = rev(c("abd.saliva.potential", "abd.saliva.realised", "abd.stool.potential", "abd.stool.realised")))
+plot.df$site <- ""
+plot.df$site[plot.df$variable %in% c("abd.saliva.realised", "abd.saliva.potential")] <- "saliva"
+plot.df$site[plot.df$variable %in% c("abd.stool.realised", "abd.stool.potential")] <- "stool"
+plot.df$type <- "realised"
+plot.df$type[plot.df$variable %in% c("abd.stool.potential", "abd.saliva.potential")] <- "potential"
+
+library(ggridges, quietly = T)
+#Plot fraction of transmitting/transmitted species per individual
+p.quant.per_subject.hist <- ggplot(plot.df, aes(y=value, x=variable, fill=variable, colour=variable)) +
+  #geom_density(alpha=0.6, stat = "density") +
+  geom_violin(scale = "width", colour=NA, alpha=0.3) +
+  geom_point(position=position_jitterdodge(jitter.width = 0.3, jitter.height = 0), size=0.2, alpha=0.8) +
+  geom_point(data=aggregate(value ~ variable, data=plot.df, mean), size=1, colour="black", alpha=1) +
+  #geom_density_ridges(scale=0.5, jittered_points=T, position = position_raincloud(height = 0.1), alpha=0.8, aes(point_color=variable), point_size=0.3, point_alpha=0.7) +
+  #scale_discrete_manual(aesthetics = "point_color", values=rev(c("#6baed6", PARAM$colour.saliva, "#fdd0a2", PARAM$colour.gut))) +
+  scale_fill_manual(values=rev(c("#6baed6", PARAM$colour.saliva, "#fdd0a2", PARAM$colour.gut)), name="Body Site") +
+  scale_colour_manual(values=rev(c("#6baed6", PARAM$colour.saliva, "#fdd0a2", PARAM$colour.gut)), name="Body Site") +
+  #Add means as horizontal lines
+  geom_hline(yintercept = mean(quant.summary$abd.saliva.realised), colour=PARAM$colour.saliva, size=0.3) +
+  geom_hline(yintercept = mean(quant.summary$abd.saliva.realised + quant.summary$abd.saliva.potential), colour="#6baed6", size=0.3) +
+  geom_hline(yintercept = mean(quant.summary$abd.stool.realised), colour=PARAM$colour.gut, size=0.3) +
+  geom_hline(yintercept = mean(quant.summary$abd.stool.realised + quant.summary$abd.stool.potential), colour="#fdd0a2", size=0.3) +
+  scale_y_continuous(breaks = c(0, 0.1, 0.25, 0.5, 0.75, 1), limits = c(0,1)) +
+  #theme_ridges() +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    #axis.text.x = element_text(family="Helvetica", size=5),
+    #axis.text.y = element_text(family="Helvetica", size=5),
+    strip.text = element_blank(),
+    panel.grid.minor = element_blank(),
+    #panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.margin = unit(c(0, 0, 0, 0), "cm")
+  ) +
+  NULL
+p.quant.per_subject.hist
+
+ggsave(p.quant.per_subject.hist, width=6, height=5, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_2.hist_summary.violins.pdf"), useDingbats=F, dpi=1200)
+```
+
+Generate summary heatmap of co-variates associated to total transmitted abundance in saliva and stool.
+
+```{r}
+plot.df <- collect.R2
+
+#Re-level co-variate factor
+taxa.ordered <- keep.genera.cor
+plot.df$covariate <- factor(as.character(plot.df$covariate), levels = c(
+  "cohort", "sex", "age", "bmi",
+  "transmit abd in paired site",
+  "richness saliva", "richness stool",
+  "community composition saliva", "community composition stool",
+  paste("abd saliva", taxa.ordered),
+  paste("abd stool", taxa.ordered)
+))
+
+p.assoc_summary <- ggplot(plot.df, aes(x=variable, y=covariate, fill=var.explained)) +
+  geom_tile() +
+  scale_fill_gradient2(low="#762a83", high=PARAM$colour.transmitter, mid = "white", limits=c(-0.6, 0.6)) +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_text(family="Helvetica", size=4),
+    panel.grid = element_blank()
+  ) +
+  NULL
+p.assoc_summary
+
+ggsave(p.assoc_summary, file=paste0(PARAM$folder.manuscript.figure, "association_summary.heatmap.pdf"), height=12, width=8, units="cm", useDingbats = F)
+```
+
+Export tabular data on co-variates of transmitted / transmissible abundance.
+
+```{r}
+write.table(specI.correlations, file=paste0(PARAM$folder.results, "covariates.specI_all.correlations.tsv"), sep="\t", col.names = NA)
+write.table(specI.correlations.genus, file=paste0(PARAM$folder.results, "covariates.specI_genus.correlations.tsv"), sep="\t", col.names = NA)
+write.table(collect.R2, file=paste0(PARAM$folder.results, "covariates.summary.tsv"), sep="\t", col.names = NA)
+```
+
+Generate scatter plots to associate alpha diversity and taxa abundances to transmitted / transmissible abundances.
+
+```{r}
+plot.df <- quant.summary
+plot.df[match(data.sample[samples.saliva, "subject"], as.character(quant.summary$subject)), "richness.saliva"] <- alpha.frame.saliva$q.0
+plot.df[match(data.sample[samples.stool, "subject"], as.character(quant.summary$subject)), "richness.stool"] <- alpha.frame.stool$q.0
+
+plot.df.melt <- melt(plot.df, measure.vars = c("abd.saliva.realised", "abd.stool.realised"), variable.name = "site.transmitted", value.name = "transmitted.abundance")
+plot.df.melt_melt <- melt(plot.df.melt, measure.vars = c("richness.saliva", "richness.stool"), variable.name = "site.richness", value.name = "richness")
+
+p.richness.scatter <- ggplot(plot.df.melt_melt, aes(x=richness, y=transmitted.abundance, group=site.transmitted, colour=site.transmitted)) +
+  geom_point(size=0.3, alpha=0.7) +
+  geom_smooth(method="lm", se = FALSE, size=0.3) +
+  scale_color_manual(values = c(PARAM$colour.saliva, PARAM$colour.gut)) +
+  scale_y_log10() +
+  facet_wrap(~site.richness * site.transmitted, nrow=2) +
+  theme_minimal()
+p.richness.scatter
+```
+
+Plot directionality as heatmaps (as supp materials)
+
+```{r, fig.width=6, fig.height=10}
+plot.dt <- my.data.taxa
+plot.dt$transmitter.category <- factor(plot.dt$transmitter.category, levels=rev(c("transmitter", "occasional transmitter", "non-transmitter", "predominantly oral", "predominantly fecal")))
+
+#Assign categories: positive OR, positive OR significant
+plot.data.directionality <- droplevels(curr.data.rates[as.character(curr.data.rates$Tax_ID) %in% as.character(plot.dt$Tax_ID), ])
+plot.dt <- droplevels(plot.dt[as.character(plot.dt$Tax_ID) %in% as.character(plot.data.directionality$Tax_ID), ])
+plot.data.directionality$category <- NA
+plot.data.directionality$category[plot.data.directionality$odds_ratio > 1] <- "positive OR"
+plot.data.directionality$category[plot.data.directionality$odds_ratio > 1 & plot.data.directionality$p < 0.05] <- "sig positive"
+plot.data.directionality$category[plot.data.directionality$odds_ratio < 1] <- "negative OR"
+plot.data.directionality$category[plot.data.directionality$odds_ratio < 1 & plot.data.directionality$p < 0.05] <- "sig negative"
+plot.data.directionality$category <- factor(plot.data.directionality$category, levels=c("sig negative", "negative OR", "no evidence", "positive OR" ,"sig positive"))
+###################################
+#Get ordering of subjects
+#=> decreasing by taxa w/ positive odds ratios
+order.subjects.directionality <- names(sort(table(plot.data.directionality[plot.data.directionality$source_sink == "saliva_to_stool" & plot.data.directionality$category  %in% c("positive OR", "sig positive"), "subject"]), decreasing=T))
+#Get taxa ordering
+#=> within transmitter category
+#=> by decreasing no of subjects w/ positive odds ratios
+order.by_cat.score <- order(plot.dt$transmitter.category, rank(table(plot.data.directionality[plot.data.directionality$source_sink == "saliva_to_stool" & plot.data.directionality$category  %in% c("positive OR", "sig positive"), "Taxon"])), decreasing = T)
+###################################
+#Plot heatmap for saliva
+p.directionality.heatmap.saliva <- ggplot(plot.data.directionality[plot.data.directionality$source_sink == "saliva_to_stool", ], aes(x=subject, y=Taxon, fill=category)) +
+  geom_tile() +
+  scale_fill_manual(values=c("#d9d9d9", "#f7f7f7", "#6baed6", PARAM$colour.saliva), na.value="white") +
+  scale_x_discrete(limits=order.subjects.directionality) +
+  scale_y_discrete(limits=rev(as.character(plot.dt$Scientific_Name[order.by_cat.score]))) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(family="Helvetica", size=4),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank(),
+    plot.margin = unit(c(0, 0, 0, 0), "cm")
+  ) +
+  NULL
+p.directionality.heatmap.saliva
+#Plot heatmap for stool
+p.directionality.heatmap.stool <- ggplot(plot.data.directionality[plot.data.directionality$source_sink == "stool_to_saliva", ], aes(x=subject, y=Taxon, fill=category)) +
+  geom_tile() +
+  scale_fill_manual(values=c("#d9d9d9", "#f7f7f7", "#fdd0a2", PARAM$colour.gut), na.value="white") +
+  scale_x_discrete(limits=order.subjects.directionality) +
+  scale_y_discrete(limits=rev(as.character(plot.dt$Scientific_Name[order.by_cat.score]))) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    axis.text = element_blank(),
+    #axis.text.y = element_text(family="Helvetica", size=4),
+    axis.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text.x = element_blank(),
+    plot.margin = unit(c(0, 0, 0, 0), "cm")
+  ) +
+  NULL
+p.directionality.heatmap.stool
+
+#Combine directionality heatmaps
+p.directionality <- plot_grid(
+  p.directionality.heatmap.saliva,
+  p.directionality.heatmap.stool,
+  ncol=2,
+  align="h",
+  rel_widths = c(2, 1)
+)
+#Save
+p.directionality.gg <- ggdraw(p.directionality)
+p.directionality.gg
+ggsave(p.directionality.gg, width=21, height=29.7, units = "cm", filename=paste0(PARAM$folder.manuscript.figure, "Figure_SX.directionality.draft.v01.pdf"), useDingbats=F, dpi=1200)
+```
+
