@@ -1,0 +1,294 @@
+---
+title: "Classification of high/low saliva/gut transmission"
+author: "Jakob Wirbel"
+date: "2018-12-22"
+output: BiocStyle::html_document
+---
+
+
+# Preparations 
+
+```{r options}
+options(stringsAsFactors = FALSE)
+## beware the defaults in R!
+```
+
+```{r packages, message=FALSE}
+library("SIAMCAT") # IMPORTANT: version 1.0.1 #
+library("tidyverse")
+library("readxl")
+```
+
+## Load Data
+
+```{r load_data}
+# features
+feat <- read.table(file = './oral_gut.specI_abd_filtered.tsv',
+                   sep='\t', header=TRUE, row.names = 1, 
+                   check.names = FALSE)
+
+# meta-data
+meta <- read.table(file='./oral_gut.transmission_abd.tsv',
+                   sep='\t', header=TRUE,
+                   check.names = FALSE)
+
+stopifnot(all(meta$sample.oral %in% colnames(feat)))
+stopifnot(all(meta$sample.gut %in% colnames(feat)))
+
+# taxa information
+tax.info <- read_excel('./Table_S2.taxa_metadata.xlsx', sheet=2)
+stopifnot(all(as.character(tax.info$Tax_ID) == rownames(feat)))
+
+# rename features
+rownames(feat) <- tax.info$Scientific_Name
+```
+
+
+## Preprocess transmission rates into quantiles
+
+```{r preprocess_label}
+percentiles_split <- c(0, 0.25, 0.75, 1)
+
+# transform transmission rates into high/medium/low
+meta <- meta %>%
+  mutate(abd.saliva.factor = 
+           cut(abd.saliva.transmitted, 
+               breaks=quantile(abd.saliva.transmitted, probs=percentiles_split), 
+               labels = c('low', 'medium', 'high'),
+               include.lowest = TRUE)) %>%
+  mutate(abd.stool.factor = 
+           cut(abd.stool.transmitted, 
+               breaks=quantile(abd.stool.transmitted, probs=percentiles_split), 
+               labels=c('low', 'medium', 'high'),
+               include.lowest = TRUE))
+
+# plot histograms
+# saliva
+meta %>%
+  ggplot(aes(x=reorder(sample.oral, -abd.saliva.transmitted), 
+             y=abd.saliva.transmitted, fill=abd.saliva.factor)) +
+    geom_bar(stat='identity', col=NA) + 
+    theme_classic() + 
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    xlab('Samples') + 
+    ylab('Saliva transmission rate') + 
+    scale_fill_manual(values=c('#d9544d', '#39ad48', '#3b5b92'), name='Group') +
+    scale_y_continuous(limits=c(0, 0.8), expand = c(0, 0))
+# stool
+meta %>%
+  ggplot(aes(x=reorder(sample.gut, -abd.stool.transmitted), 
+             y=abd.stool.transmitted, fill=as.factor(abd.stool.factor))) +
+    geom_bar(stat='identity', col=NA) + 
+    theme_classic() + 
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    xlab('Samples') + 
+    ylab('Saliva transmission rate') + 
+    scale_fill_manual(values=c('#d9544d', '#39ad48', '#3b5b92'), name='Group') +
+    scale_y_continuous(limits=c(0, 0.4), expand = c(0, 0))
+```
+
+
+## Create SIAMCAT label 
+
+Now, we create the label objects for the different classification tasks we 
+want to investigate.
+
+```{r create_label}
+
+# delete superfluous metadata (not needed for plotting later)
+meta <- meta %>% 
+  select(sample.oral, sample.gut, group, abd.saliva.transmitted,
+         abd.stool.transmitted, abd.saliva.factor, abd.stool.factor)
+
+# prediction using the saliva samples as input features
+meta.saliva <- meta
+rownames(meta.saliva) <- meta$sample.saliva # rownames are needed for SIAMCAT
+meta.saliva <- meta.saliva[,-c(1,2)]
+
+# predict saliva transmission rates
+label.saliva.saliva <- create.label(
+  'abd.saliva.factor', case='high', control='low', meta=meta.saliva
+  )
+# predict gut transmission rates
+label.saliva.stool <- create.label(
+  'abd.stool.factor', case='high', control='low', meta=meta.saliva
+)
+
+
+# and the same for gut samples
+meta.stool <- meta
+meta.stool <- meta.stool[,-c(1,2)]
+# prediction using the gut samples as input features
+rownames(meta.stool) <- meta$sample.gut
+# predict saliva transmission rates
+label.stool.saliva <- create.label(
+  'abd.saliva.factor', case='high', control='low', meta=meta.stool
+  )
+# predict gut transmission rates
+label.stool.stool <- create.label(
+  'abd.stool.factor', case='high', control='low', meta=meta.stool
+)
+```
+
+# Machine learning part
+
+## Machine learning pipeline
+
+Since we will train several models with the same parameters, we can create a 
+function to train models.
+
+```{r ml_pipeline}
+ml.pipeline <- function(feat, meta, label){
+  siamcat <- siamcat(feat=feat, meta=meta, label=label)
+  siamcat <- normalize.features(siamcat, norm.method = 'log.std', 
+                                feature.type = 'original')
+  siamcat <- create.data.split(siamcat, num.folds = 10, num.resample = 10)
+  siamcat <- train.model(siamcat, method='lasso')
+  siamcat <- make.predictions(siamcat)
+  siamcat <- evaluate.predictions(siamcat)
+  return(siamcat)
+}
+```
+
+## Train models
+
+```{r train_models, results='hide', message=FALSE}
+if (file.exists('./siamcat_models.RData')){
+  load('./siamcat_models.RData')
+} else {
+  siamcat.saliva.stool <- ml.pipeline(feat=feat, 
+                                    meta=meta.saliva, 
+                                    label=label.saliva.stool)
+  siamcat.saliva.saliva <- ml.pipeline(feat=feat,
+                                   meta=meta.saliva,
+                                   label=label.saliva.saliva)
+  siamcat.stool.saliva <- ml.pipeline(feat=feat,
+                                    meta=meta.stool,
+                                    label=label.stool.saliva)
+  siamcat.stool.stool <- ml.pipeline(feat=feat,
+                                     meta=meta.stool,
+                                     label=label.stool.stool)
+  save(siamcat.stool.stool, siamcat.stool.saliva, 
+       siamcat.saliva.saliva, siamcat.saliva.stool,
+       file = './siamcat_models.RData')
+}
+```
+
+## Evaluation
+
+```{r eval_plot}
+model.evaluation.plot('stool-stool'=siamcat.stool.stool,
+                      'stool-saliva'=siamcat.stool.saliva,
+                      'saliva-saliva'=siamcat.saliva.saliva,
+                      'saliva-stool'=siamcat.saliva.stool)
+```
+
+```{r model_interpretation_plot}
+model.interpretation.plot(siamcat.saliva.saliva,
+                          fn.plot='./interpretation_saliva_saliva.pdf')
+model.interpretation.plot(siamcat.saliva.stool,
+                          fn.plot='./interpretation_saliva_stool.pdf')
+model.interpretation.plot(siamcat.stool.saliva,
+                          fn.plot='./interpretation_stool_saliva.pdf')
+model.interpretation.plot(siamcat.stool.stool,
+                          fn.plot='./interpretation_stool_stool.pdf')
+```
+
+Let's have a look at the features carrying the most model weight.
+
+```{r plot_model_importances_vs_transmission}
+df.plot <- tibble(
+  tax_ID = tax.info$Scientific_Name,
+  `stool-stool` = feature_weights(siamcat.stool.stool)
+    [as.character(tax.info$Scientific_Name),"mean.rel.weight"],
+  `stool-saliva` = feature_weights(siamcat.stool.saliva)
+    [as.character(tax.info$Scientific_Name),"mean.rel.weight"],
+  `saliva-stool` = feature_weights(siamcat.saliva.stool)
+    [as.character(tax.info$Scientific_Name),"mean.rel.weight"],
+  `saliva-saliva` = feature_weights(siamcat.saliva.saliva)
+    [as.character(tax.info$Scientific_Name),"mean.rel.weight"],
+  category = tax.info$transmitter.category,
+  transmission = as.numeric(tax.info$transmission_score.median))
+
+df.plot <- df.plot %>% 
+  gather(value=weight, key=model, -category, -transmission, -tax_ID)
+
+df.plot %>% 
+  ggplot(aes(x=category, y=weight, fill=model)) +
+    geom_boxplot()
+
+df.plot %>% 
+  select(model, category, weight) %>% 
+  group_by(model, category) %>% 
+  summarize(n_nonzero=sum(weight!=0, na.rm=TRUE)) %>% 
+  ggplot(aes(x=model, y=n_nonzero, fill=category)) +
+    geom_bar(stat='identity', position = position_dodge())
+
+df.plot %>% 
+  ggplot(aes(y=transmission, x=weight, col=category)) +
+    geom_point() + 
+    facet_grid(model~.)
+
+```
+
+
+## Eliminate transmitter species
+
+Let's eliminate the transmitter species and train some models again.
+
+```{r eliminate_features, results='hide', message=FALSE}
+if (file.exists('./siamcat_models_eliminated.RData')){
+  load('./siamcat_models_eliminated.RData')
+} else {
+  # train without transmitters
+  feat.red.1 <- feat[
+    tax.info %>% 
+      filter(transmitter.category != 'transmitter') %>%
+      pull(Scientific_Name) %>% 
+      as.character,]
+  
+  siamcat.stool.wo.trans <- ml.pipeline(feat=feat.red.1, 
+                                        meta=meta.stool, 
+                                        label=label.stool.stool)
+  
+  siamcat.saliva.wo.trans <- ml.pipeline(feat=feat.red.1, 
+                                         meta=meta.stool, 
+                                         label=label.stool.saliva)
+  save(siamcat.stool.wo.trans, siamcat.saliva.wo.trans, 
+       file = './siamcat_models_eliminated.RData')
+}
+```
+
+```{r model_plot_again}
+model.evaluation.plot(siamcat.stool.wo.trans, siamcat.saliva.wo.trans)
+
+model.interpretation.plot(siamcat.stool.wo.trans,
+                          fn.plot = './interpretation_stool_eleminated_1.pdf')
+
+model.interpretation.plot(siamcat.saliva.wo.trans,
+                          fn.plot = './interpretation_saliva_eleminated_1.pdf')
+```
+
+## Combined Evaluation Plot
+
+Now that we have all the models trained, we can compare how well the different
+features can predict the transmission group in saliva and stool.
+
+```{r grouped_evalation}
+# for saliva samples
+model.evaluation.plot('based on saliva'=siamcat.saliva.saliva,
+                      'based on stool'=siamcat.stool.saliva,
+                      'based on stool\n(without transmitter)'=
+                        siamcat.saliva.wo.trans)
+
+model.evaluation.plot('based on saliva'=siamcat.saliva.stool,
+                      'based on stool'=siamcat.stool.stool,
+                      'based on stool\n(without transmitter)'=
+                        siamcat.stool.wo.trans)
+```
+
+# SessionInfo
+
+```{r session_info}
+sessionInfo()
+```
