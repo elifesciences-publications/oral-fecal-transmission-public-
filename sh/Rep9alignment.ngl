@@ -1,0 +1,34 @@
+# We assume that the the samples are organized one per directory and the file
+# `sample.list` contains a list of all the samples
+#
+# Outputs will be written into the `outputs/` directory, which should exist
+# before running this script (NGLess will check for it).
+#
+ngless "0.0"
+import "parallel" version "0.0"
+import "mocat" version "0.0"
+import "samtools" version "0.0"
+
+samples = readlines('sample.list')
+sample = lock1(samples)
+input = load_mocat_sample(sample)
+
+preprocess(input, keep_singles=False) using |read|:
+    read = substrim(read, min_quality=25)
+    if len(read) < 45:
+        discard
+mapped = map(input, reference='hg19')
+
+mapped = select(mapped) using |mr|:
+    mr = mr.filter(min_match_size=45, min_identity_pc=90, action={unmatch})
+    if mr.flag({mapped}):
+       discard
+input = as_reads(mapped)
+
+
+# RepGenomesv9.fna is the set of representative genomes
+# Available from http://progenomes.embl.de/representatives.cgi
+mapped = map(input, fafile='RepGenomesv9/RepGenomesv9.fna', mode_all=True)
+mapped = select(mapped, keep_if=[{mapped}, {unique}])
+mapped = samtools_sort(mapped)
+write(mapped, ofile='outputs/' + sample + '.RepGenomesv9.unique.sorted.bam')
